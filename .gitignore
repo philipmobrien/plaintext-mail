@@ -1,0 +1,44 @@
+# Xcode
+#
+build/
+DerivedData/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.xcuserstate
+*.xcscmblueprint
+*.xcscheme
+*.xcuserstate
+
+# Swift Package Manager
+#
+# Xcode-managed SwiftPM builds output here - safe to ignore.
+# Package.resolved is intentionally NOT ignored below - it pins exact
+# dependency versions (e.g. GRDB) and should be committed for reproducible
+# builds.
+.build/
+.swiftpm/
+
+# CocoaPods (not currently used, harmless to ignore pre-emptively)
+#
+Pods/
+
+# macOS
+#
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Personal/generated data - lives outside the project folder in the
+# temporary directory (FileManager.default.temporaryDirectory), not inside
+# the repo, so nothing to ignore here for mail.sqlite or the eml-corpus
+# cache - but flagging why they're absent from this list rather than just
+# silently missing.
