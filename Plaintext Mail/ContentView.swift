@@ -31,12 +31,15 @@ struct ContentView: View {
     @StateObject private var outbox = OutboxManager()
     @State private var selectedMessages: Set<Message.ID> = []
     @State private var composeTarget: ComposeTarget?
+    @State private var redirectTarget: RedirectTarget?
     @State private var sidebarSelection: SidebarSelection? = .mailbox("INBOX")
     @State private var showEmptyTrashConfirm = false
     @State private var searchQuery = ""
     @State private var smartFolderSheetTarget: SmartFolderSheetTarget?
     @State private var sortOption: SortOption = .dateNewest
     @State private var showShortcutsHelp = false
+    @State private var showEditSignatures = false
+    @State private var showAddAccount = false
     @State private var dropTargetedMailbox: String?
 
     enum SmartFolderSheetTarget: Identifiable {
@@ -58,6 +61,14 @@ struct ContentView: View {
         let subject: String
         let body: String
         let sentFolder: String
+    }
+
+    struct RedirectTarget: Identifiable {
+        let id = UUID()
+        let message: Message
+        let raw: String
+        let sentFolder: String
+        let defaultFrom: String
     }
 
     /// Real folder names via discovery, falling back to Runbox's own naming
@@ -235,13 +246,28 @@ struct ContentView: View {
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Button {
-                        composeTarget = ComposeTarget(from: accountsStore.accounts.first?.email ?? "", to: "", cc: "", subject: "", body: "", sentFolder: session.folderName(for: "sent", fallback: "Sent"))
+                        let newMessageFrom = accountsStore.accounts.first?.email ?? ""
+                        composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: session.folderName(for: "sent", fallback: "Sent"))
                     } label: {
                         Label("Compose", systemImage: "square.and.pencil")
                     }
                     // Cmd+N is owned by the real menu bar now (MailAppApp.swift's
                     // CommandGroup replacing .newItem) - declaring it here too
                     // would risk a double-registration conflict.
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        showEditSignatures = true
+                    } label: {
+                        Label("Edit Signatures", systemImage: "signature")
+                    }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        showAddAccount = true
+                    } label: {
+                        Label("Add Account", systemImage: "person.badge.plus")
+                    }
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
@@ -281,6 +307,13 @@ struct ContentView: View {
             .sheet(item: $composeTarget) { target in
                 ComposeView(outbox: outbox, accountsStore: accountsStore, from: target.from, to: target.to, cc: target.cc, subject: target.subject, messageBody: target.body, sentFolder: target.sentFolder)
             }
+            .sheet(item: $redirectTarget) { target in
+                RedirectView(
+                    outbox: outbox, accountsStore: accountsStore,
+                    originalMessage: target.message, originalRaw: target.raw,
+                    sentFolder: target.sentFolder, defaultFrom: target.defaultFrom
+                )
+            }
             // Shortcuts that act on the current selection now live in the
             // real menu bar (MailAppApp.swift) rather than as hidden
             // buttons here - the menu bridges to these same action
@@ -292,6 +325,12 @@ struct ContentView: View {
             .onReceive(menuNotificationPublisher) { handleMenuNotification($0) }
             .sheet(isPresented: $showShortcutsHelp) {
                 ShortcutsHelpView()
+            }
+            .sheet(isPresented: $showEditSignatures) {
+                EditSignaturesView(accountsStore: accountsStore)
+            }
+            .sheet(isPresented: $showAddAccount) {
+                AddAccountView(accountsStore: accountsStore)
             }
             .task {
                 session.loadSmartFolders()
@@ -305,7 +344,19 @@ struct ContentView: View {
                     session: session,
                     onReply: { composeTarget = replyTarget(for: message, replyAll: false) },
                     onReplyAll: { composeTarget = replyTarget(for: message, replyAll: true) },
-                    onForward: { composeTarget = forwardTarget(for: message) }
+                    onForward: { composeTarget = forwardTarget(for: message) },
+                    onRedirect: {
+                        if let raw = cachedRawMessage(for: message) {
+                            let isSent = message.mailbox == session.folderName(for: "sent", fallback: "Sent")
+                            let defaultFrom = isSent ? message.from : message.toAlias
+                            redirectTarget = RedirectTarget(
+                                message: message,
+                                raw: raw,
+                                sentFolder: session.folderName(for: "sent", fallback: "Sent"),
+                                defaultFrom: defaultFrom
+                            )
+                        }
+                    }
                 )
             } else if selectedMessages.count > 1 {
                 Text("\(selectedMessages.count) messages selected")
@@ -399,7 +450,8 @@ struct ContentView: View {
     private func handleMenuNotification(_ notification: Notification) {
         switch notification.name {
         case .menuComposeNewMessage:
-            composeTarget = ComposeTarget(from: accountsStore.accounts.first?.email ?? "", to: "", cc: "", subject: "", body: "", sentFolder: session.folderName(for: "sent", fallback: "Sent"))
+            let newMessageFrom = accountsStore.accounts.first?.email ?? ""
+                        composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: session.folderName(for: "sent", fallback: "Sent"))
         case .menuReply:
             if let message = selectedSingleMessage { composeTarget = replyTarget(for: message, replyAll: false) }
         case .menuReplyAll:
@@ -481,6 +533,19 @@ struct ContentView: View {
         session.toggleUnreadForMessages(items: items, markAsUnread: markAsUnread) { }
     }
 
+    /// Formats an account's signature with the standard "-- " delimiter
+    /// line (dash-dash-space, on its own line) - the longstanding
+    /// convention most mail clients recognise for marking where a
+    /// signature block starts, e.g. for auto-stripping on reply. Returns
+    /// empty if the account has no signature set or isn't found.
+    private func signatureBlock(for email: String) -> String {
+        guard let account = accountsStore.accounts.first(where: { $0.email == email }),
+              !account.signature.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return ""
+        }
+        return "\n\n-- \n\(account.signature)\n"
+    }
+
     // MARK: - Compose target construction
 
     private func replyTarget(for message: Message, replyAll: Bool) -> ComposeTarget {
@@ -505,7 +570,7 @@ struct ContentView: View {
             to: toDefault,
             cc: cc,
             subject: message.subject.hasPrefix("Re: ") ? message.subject : "Re: \(message.subject)",
-            body: "",
+            body: signatureBlock(for: fromDefault),
             sentFolder: session.folderName(for: "sent", fallback: "Sent")
         )
     }
@@ -535,7 +600,7 @@ struct ContentView: View {
             to: "",
             cc: "",
             subject: message.subject.hasPrefix("Fwd: ") ? message.subject : "Fwd: \(message.subject)",
-            body: body,
+            body: signatureBlock(for: fromDefault) + body,
             sentFolder: session.folderName(for: "sent", fallback: "Sent")
         )
     }
@@ -1056,6 +1121,7 @@ struct MessageDetailView: View {
     let onReply: () -> Void
     let onReplyAll: () -> Void
     let onForward: () -> Void
+    let onRedirect: () -> Void
     @StateObject private var contactsService = ContactsService()
     @State private var contactAddState: ContactAddState = .idle
     @State private var bodyText: String?
@@ -1087,6 +1153,9 @@ struct MessageDetailView: View {
                     }
                     Button { onForward() } label: {
                         Label("Forward", systemImage: "arrowshape.turn.up.right")
+                    }
+                    Button { onRedirect() } label: {
+                        Label("Redirect", systemImage: "arrowshape.bounce.right")
                     }
                     Button { addSenderToContacts() } label: {
                         switch contactAddState {

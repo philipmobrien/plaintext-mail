@@ -42,6 +42,7 @@
 				ContactsService.swift,
 				Database.swift,
 				DiscoveredFolder.swift,
+				EditSignaturesView.swift,
 				EnvelopeParser.swift,
 				HTMLToText.swift,
 				IMAPClient.swift,
@@ -52,6 +53,7 @@
 				MIMEParser.swift,
 				"MIMEPart+BodyText.swift",
 				OutboxManager.swift,
+				RedirectView.swift,
 				SMTPClient.swift,
 			);
 			target = D9111146302243E8004599C0 /* Plaintext Mail */;
@@ -66,8 +68,10 @@
 				ComposeSession.swift,
 				ComposeView.swift,
 				ContactsService.swift,
+				EditSignaturesView.swift,
 				KeychainStore.swift,
 				OutboxManager.swift,
+				RedirectView.swift,
 			);
 			target = D9386E343020779700F2B841 /* IMAPSpike */;
 		};

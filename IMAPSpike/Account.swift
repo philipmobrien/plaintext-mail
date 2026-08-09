@@ -13,4 +13,5 @@ struct Account: Codable, Identifiable, Equatable {
     var imapPort: Int
     var smtpHost: String
     var smtpPort: Int
+    var signature: String = ""   // plain text, auto-appended to outgoing mail from this account
 }

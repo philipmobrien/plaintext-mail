@@ -68,7 +68,7 @@ final class ContactsService: ObservableObject {
                 CNContactFormatter.descriptorForRequiredKeys(for: .fullName),
             ]
 
-            var results: [ContactMatch] = []
+            var results: [ContactsService.ContactMatch] = []
             var seenEmails = Set<String>()
 
             let fetchRequest = CNContactFetchRequest(keysToFetch: keys)
@@ -82,7 +82,7 @@ final class ContactsService: ObservableObject {
                     guard nameMatches || emailMatches else { continue }
                     guard !seenEmails.contains(email.lowercased()) else { continue }
                     seenEmails.insert(email.lowercased())
-                    results.append(ContactMatch(displayName: name.isEmpty ? email : name, email: email))
+                    results.append(ContactsService.ContactMatch(displayName: name.isEmpty ? email : name, email: email))
                 }
 
                 if results.count >= 25 { stop.pointee = true }
