@@ -818,6 +818,54 @@ final class MailSession: ObservableObject {
     /// \Deleted, then EXPUNGE to actually remove them. Unlike moveMessage,
     /// this is genuinely irreversible - there's no mailbox to move these
     /// back from afterward.
+    /// Moves every message in `mailbox` to `destinationMailbox` in one
+    /// server-side operation (e.g. "move all of Spam to Trash") - operates
+    /// on the whole range (1:*), not just whatever's cached locally, same
+    /// principle as emptyTrash. The destination mailbox's local cache picks
+    /// up the moved messages naturally next time it's synced/visited,
+    /// rather than trying to track individual new UIDs for a bulk move.
+    func moveAllMessages(from mailbox: String, to destinationMailbox: String, completion: @escaping () -> Void) {
+        guard connectionState == .ready, let client, !isProcessingQueue, !isSelectingMailbox else {
+            completion()
+            return
+        }
+        isProcessingQueue = true
+
+        ensureSelected(mailbox) { [weak self] selected in
+            guard selected, let self else {
+                self?.isProcessingQueue = false
+                completion()
+                return
+            }
+            client.send("UID MOVE 1:* \(destinationMailbox)") { reply, _ in
+                Task { @MainActor in
+                    self.isProcessingQueue = false
+                    guard reply.key == "OK" else {
+                        completion()
+                        self.processQueueIfNeeded()
+                        return
+                    }
+                    // Everything's gone from the source mailbox now - clear
+                    // its local cache entirely.
+                    if let dbQueue = try? self.database() {
+                        _ = try? dbQueue.write { db in
+                            try Message.filter(Column("mailbox") == mailbox).deleteAll(db)
+                        }
+                    }
+                    let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus")
+                    if let files = try? FileManager.default.contentsOfDirectory(at: corpusDir, includingPropertiesForKeys: nil) {
+                        for file in files where file.lastPathComponent.hasPrefix("\(mailbox)-") {
+                            try? FileManager.default.removeItem(at: file)
+                        }
+                    }
+                    self.loadMessagesFromDB()
+                    completion()
+                    self.processQueueIfNeeded()
+                }
+            }
+        }
+    }
+
     func emptyTrash(mailbox: String = "Trash", completion: @escaping (Result<Void, Error>) -> Void) {
         guard connectionState == .ready, let client, !isProcessingQueue, !isSelectingMailbox, currentMailbox == mailbox else {
             completion(.failure(SessionError.notReady))

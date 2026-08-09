@@ -111,6 +111,20 @@ struct ContentView: View {
                             } isTargeted: { targeted in
                                 dropTargetedMailbox = targeted ? mailbox.name : nil
                             }
+                            .contextMenu {
+                                if mailbox.role == "trash" {
+                                    Button("Empty Trash", role: .destructive) {
+                                        showEmptyTrashConfirm = true
+                                    }
+                                } else if mailbox.role == "junk" {
+                                    Button("Move All to Trash") {
+                                        let trashFolder = mailboxes.first(where: { $0.role == "trash" })?.name ?? "Trash"
+                                        session.moveAllMessages(from: mailbox.name, to: trashFolder) { }
+                                    }
+                                }
+                                // No context menu items for other mailboxes -
+                                // deliberately scoped to just these two.
+                            }
                     }
                 }
                 Section("Smart Folders") {
@@ -242,6 +256,7 @@ struct ContentView: View {
                             Label("Sync", systemImage: "arrow.triangle.2.circlepath")
                         }
                     }
+                    .help("Sync this mailbox now - checks for new mail and deletions, and refreshes read/unread status")
                     .disabled(session.connectionState != .ready || session.isSyncing)
                 }
                 ToolbarItem(placement: .primaryAction) {
@@ -251,6 +266,7 @@ struct ContentView: View {
                     } label: {
                         Label("Compose", systemImage: "square.and.pencil")
                     }
+                    .help("New Message (⌘N)")
                     // Cmd+N is owned by the real menu bar now (MailAppApp.swift's
                     // CommandGroup replacing .newItem) - declaring it here too
                     // would risk a double-registration conflict.
@@ -261,6 +277,7 @@ struct ContentView: View {
                     } label: {
                         Label("Edit Signatures", systemImage: "signature")
                     }
+                    .help("Edit signatures for your accounts")
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Button {
@@ -268,6 +285,7 @@ struct ContentView: View {
                     } label: {
                         Label("Add Account", systemImage: "person.badge.plus")
                     }
+                    .help("Add another mail account")
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
@@ -279,6 +297,7 @@ struct ContentView: View {
                     } label: {
                         Label("Sort", systemImage: "arrow.up.arrow.down")
                     }
+                    .help("Sort messages by date, sender, or recipient")
                 }
                 let trashFolder = session.folderName(for: "trash", fallback: "Trash")
                 if session.currentMailbox == trashFolder, sidebarSelection == .mailbox(trashFolder) {
@@ -289,11 +308,12 @@ struct ContentView: View {
                             Label("Empty Trash", systemImage: "trash.slash")
                         }
                         .disabled(session.messages.isEmpty)
+                        .help("Permanently delete everything in Trash - this cannot be undone")
                     }
                 }
             }
             .confirmationDialog(
-                "Permanently delete all \(session.messages.count) message(s) in Trash?",
+                "Permanently delete all messages in Trash?",
                 isPresented: $showEmptyTrashConfirm,
                 titleVisibility: .visible
             ) {
