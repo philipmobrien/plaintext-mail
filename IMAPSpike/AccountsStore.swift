@@ -56,6 +56,12 @@ final class AccountsStore: ObservableObject {
         persist()
     }
 
+    func updateSignature(for accountID: UUID, signature: String) {
+        guard let index = accounts.firstIndex(where: { $0.id == accountID }) else { return }
+        accounts[index].signature = signature
+        persist()
+    }
+
     func password(for account: Account) -> String? {
         KeychainStore.load(service: keychainService, account: account.id.uuidString)
     }

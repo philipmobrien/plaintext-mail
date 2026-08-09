@@ -22,6 +22,7 @@ final class OutboxManager: ObservableObject {
         let user: String
         let password: String
         let sentFolder: String
+        let prebuiltRawMessage: String?
         let from: String
         let to: String
         let cc: String
@@ -44,7 +45,8 @@ final class OutboxManager: ObservableObject {
         imapHost: String, imapPort: Int, smtpHost: String, smtpPort: Int, user: String, password: String,
         sentFolder: String,
         from: String, to: String, cc: String, subject: String, markdownBody: String,
-        attachments: [ComposeAttachment]
+        attachments: [ComposeAttachment],
+        prebuiltRawMessage: String? = nil
     ) {
         let item = OutboxItem(
             subjectPreview: subject.isEmpty ? "(no subject)" : subject,
@@ -52,6 +54,7 @@ final class OutboxManager: ObservableObject {
             status: .sending,
             imapHost: imapHost, imapPort: imapPort, smtpHost: smtpHost, smtpPort: smtpPort, user: user, password: password,
             sentFolder: sentFolder,
+            prebuiltRawMessage: prebuiltRawMessage,
             from: from, to: to, cc: cc, subject: subject, markdownBody: markdownBody,
             attachments: attachments
         )
@@ -81,7 +84,8 @@ final class OutboxManager: ObservableObject {
             user: item.user, password: item.password,
             sentFolder: item.sentFolder,
             from: item.from, to: item.to, cc: item.cc, subject: item.subject, markdownBody: item.markdownBody,
-            attachments: item.attachments
+            attachments: item.attachments,
+            prebuiltRawMessage: item.prebuiltRawMessage
         ) { [weak self] result in
             Task { @MainActor in
                 guard let self else { return }

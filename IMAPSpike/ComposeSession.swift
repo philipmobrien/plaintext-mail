@@ -50,6 +50,7 @@ final class ComposeSession: ObservableObject {
         sentFolder: String,
         from: String, to: String, cc: String, subject: String, markdownBody: String,
         attachments: [ComposeAttachment] = [],
+        prebuiltRawMessage: String? = nil,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         isSending = true
@@ -60,8 +61,11 @@ final class ComposeSession: ObservableObject {
         let allRecipients = toRecipients + ccRecipients
 
         // Composed once - the exact same bytes go out over SMTP and, on
-        // success, get archived via IMAP APPEND.
-        let rawMessage = MessageComposer.compose(from: from, to: to, cc: cc, subject: subject, markdownBody: markdownBody, attachments: attachments)
+        // success, get archived via IMAP APPEND. If a pre-built raw message
+        // is supplied (Redirect - the original message untouched, with
+        // Resent-* headers layered on top), that's used verbatim instead of
+        // building a fresh message from the compose fields.
+        let rawMessage = prebuiltRawMessage ?? MessageComposer.compose(from: from, to: to, cc: cc, subject: subject, markdownBody: markdownBody, attachments: attachments)
 
         let smtpPortValue = NWEndpoint.Port(rawValue: UInt16(smtpPort)) ?? 465
         let client = SMTPClient(host: smtpHost, port: smtpPortValue)
@@ -208,6 +212,31 @@ final class ComposeSession: ObservableObject {
         let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus")
         try? FileManager.default.createDirectory(at: corpusDir, withIntermediateDirectories: true)
         try? rawMessage.write(to: corpusDir.appendingPathComponent("\(mailbox)-\(uid).eml"), atomically: true, encoding: .utf8)
+    }
+}
+
+/// Builds a Redirect - distinct from Forward, this preserves the original
+/// message completely untouched (headers and body both), and layers new
+/// Resent-* headers (RFC 5322 §3.6.6) on top. The recipient's client shows
+/// it as coming from the original sender, with the Resent-* headers noting
+/// who redirected it and when - the correct, standards-based mechanism for
+/// this, not a hack built on top of the ordinary Forward flow.
+enum RedirectComposer {
+    static func buildRedirect(originalRaw: String, from: String, to: String) -> String {
+        let messageId = "<\(UUID().uuidString)@personal-mail-client>"
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.dateFormat = "EEE, d MMM yyyy HH:mm:ss Z"
+        let dateHeader = dateFormatter.string(from: Date())
+
+        let resentHeaders = """
+        Resent-From: \(from)
+        Resent-To: \(to)
+        Resent-Date: \(dateHeader)
+        Resent-Message-ID: \(messageId)
+        """
+
+        return resentHeaders + "\n" + originalRaw
     }
 }
 
