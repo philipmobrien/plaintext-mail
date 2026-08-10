@@ -33,6 +33,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Account.swift,
+				AccountMessage.swift,
 				AccountSessionManager.swift,
 				AccountsStore.swift,
 				AddAccountView.swift,
@@ -53,6 +54,7 @@
 				MailSession.swift,
 				MIMEParser.swift,
 				"MIMEPart+BodyText.swift",
+				MultiSessionObserver.swift,
 				OutboxManager.swift,
 				RedirectView.swift,
 				SMTPClient.swift,
@@ -63,6 +65,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Account.swift,
+				AccountMessage.swift,
 				AccountSessionManager.swift,
 				AccountsStore.swift,
 				AddAccountView.swift,
@@ -72,6 +75,7 @@
 				ContactsService.swift,
 				EditSignaturesView.swift,
 				KeychainStore.swift,
+				MultiSessionObserver.swift,
 				OutboxManager.swift,
 				RedirectView.swift,
 			);

@@ -48,9 +48,11 @@ func moveOrDelete(session: MailSession, items: [(uid: Int, mailbox: String)], to
 
 struct ContentView: View {
     @StateObject private var sessionManager = AccountSessionManager()
+    @StateObject private var multiSessionObserver = MultiSessionObserver()
     @StateObject private var accountsStore = AccountsStore()
     @StateObject private var outbox = OutboxManager()
     @State private var selectedMessages: Set<Message.ID> = []
+    @State private var selectedAccountMessage: AccountMessage?
     @State private var composeTarget: ComposeTarget?
     @State private var redirectTarget: RedirectTarget?
     @State private var sidebarSelection: SidebarSelection?
@@ -206,14 +208,15 @@ struct ContentView: View {
             }
             .onChange(of: sidebarSelection) { _, newValue in
                 selectedMessages = []
+                selectedAccountMessage = nil
                 searchQuery = ""
                 currentSession?.clearSearch()
                 switch newValue {
                 case .mailbox(let accountID, let name):
                     sessionManager.session(for: accountID)?.selectMailbox(name)
                 case .allMessages:
-                    if let account = accountsStore.accounts.first, let session = sessionManager.session(for: account.id) {
-                        session.syncMultipleMailboxes(allMessagesMailboxes(for: account.id)) { }
+                    for account in accountsStore.accounts {
+                        sessionManager.session(for: account.id)?.syncMultipleMailboxes(allMessagesMailboxes(for: account.id)) { }
                     }
                 case .smartFolder, .none:
                     break
@@ -234,7 +237,31 @@ struct ContentView: View {
             }
         } content: {
             Group {
-                if let session = currentSession, let account = currentAccount {
+                if case .allMessages = sidebarSelection {
+                    AllMessagesColumn(
+                        sessionManager: sessionManager,
+                        multiSessionObserver: multiSessionObserver,
+                        accountsStore: accountsStore,
+                        outbox: outbox,
+                        selectedAccountMessage: $selectedAccountMessage,
+                        composeTarget: $composeTarget,
+                        redirectTarget: $redirectTarget,
+                        onReply: { accountMessage in
+                            composeTarget = replyTarget(for: accountMessage.message, replyAll: false, accountID: accountMessage.accountID, session: sessionManager.session(for: accountMessage.accountID))
+                        },
+                        onReplyAll: { accountMessage in
+                            composeTarget = replyTarget(for: accountMessage.message, replyAll: true, accountID: accountMessage.accountID, session: sessionManager.session(for: accountMessage.accountID))
+                        },
+                        onForward: { accountMessage in
+                            composeTarget = forwardTarget(for: accountMessage.message, accountID: accountMessage.accountID, session: sessionManager.session(for: accountMessage.accountID))
+                        },
+                        onComposeNew: {
+                            let newMessageFrom = accountsStore.accounts.first?.email ?? ""
+                            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: "Sent")
+                        },
+                        onSyncAllSessions: { syncAllSessions() }
+                    )
+                } else if let session = currentSession, let account = currentAccount {
                     MailboxContentColumn(
                         session: session,
                         accountsStore: accountsStore,
@@ -249,9 +276,9 @@ struct ContentView: View {
                         currentAccount: account,
                         mailboxes: mailboxes(for: account.id),
                         allMessagesMailboxes: allMessagesMailboxes(for: account.id),
-                        onReply: { message in composeTarget = replyTarget(for: message, replyAll: false) },
-                        onReplyAll: { message in composeTarget = replyTarget(for: message, replyAll: true) },
-                        onForward: { message in composeTarget = forwardTarget(for: message) },
+                        onReply: { message in composeTarget = replyTarget(for: message, replyAll: false, accountID: account.id, session: session) },
+                        onReplyAll: { message in composeTarget = replyTarget(for: message, replyAll: true, accountID: account.id, session: session) },
+                        onForward: { message in composeTarget = forwardTarget(for: message, accountID: account.id, session: session) },
                         onComposeNew: {
                             let newMessageFrom = currentAccount?.email ?? accountsStore.accounts.first?.email ?? ""
                             composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: currentSession?.folderName(for: "sent", fallback: "Sent") ?? "Sent")
@@ -301,16 +328,38 @@ struct ContentView: View {
                 syncAllSessions()
             }
         } detail: {
-            if selectedMessages.count == 1, let id = selectedMessages.first,
+            if case .allMessages = sidebarSelection, let accountMessage = selectedAccountMessage,
+               let session = sessionManager.session(for: accountMessage.accountID) {
+                MessageDetailView(
+                    message: accountMessage.message,
+                    accountID: accountMessage.accountID,
+                    session: session,
+                    onReply: { composeTarget = replyTarget(for: accountMessage.message, replyAll: false, accountID: accountMessage.accountID, session: session) },
+                    onReplyAll: { composeTarget = replyTarget(for: accountMessage.message, replyAll: true, accountID: accountMessage.accountID, session: session) },
+                    onForward: { composeTarget = forwardTarget(for: accountMessage.message, accountID: accountMessage.accountID, session: session) },
+                    onRedirect: {
+                        if let raw = cachedRawMessage(for: accountMessage.message, accountID: accountMessage.accountID) {
+                            let isSent = accountMessage.message.mailbox == session.folderName(for: "sent", fallback: "Sent")
+                            let defaultFrom = isSent ? accountMessage.message.from : accountMessage.message.toAlias
+                            redirectTarget = RedirectTarget(
+                                message: accountMessage.message,
+                                raw: raw,
+                                sentFolder: session.folderName(for: "sent", fallback: "Sent"),
+                                defaultFrom: defaultFrom
+                            )
+                        }
+                    }
+                )
+            } else if selectedMessages.count == 1, let id = selectedMessages.first,
                let accountID = currentAccount?.id, let session = currentSession,
                let message = findSelectedMessage(id: id, session: session) {
                 MessageDetailView(
                     message: message,
                     accountID: accountID,
                     session: session,
-                    onReply: { composeTarget = replyTarget(for: message, replyAll: false) },
-                    onReplyAll: { composeTarget = replyTarget(for: message, replyAll: true) },
-                    onForward: { composeTarget = forwardTarget(for: message) },
+                    onReply: { composeTarget = replyTarget(for: message, replyAll: false, accountID: accountID, session: session) },
+                    onReplyAll: { composeTarget = replyTarget(for: message, replyAll: true, accountID: accountID, session: session) },
+                    onForward: { composeTarget = forwardTarget(for: message, accountID: accountID, session: session) },
                     onRedirect: {
                         if let raw = cachedRawMessage(for: message, accountID: accountID) {
                             let isSent = message.mailbox == session.folderName(for: "sent", fallback: "Sent")
@@ -390,17 +439,17 @@ struct ContentView: View {
         for session in sessionManager.sessions.values {
             session.loadSmartFolders()
         }
+        multiSessionObserver.observe(sessions: sessionManager.sessions)
     }
 
-    private func replyTarget(for message: Message, replyAll: Bool) -> ComposeTarget {
-        let session = currentSession
+    private func replyTarget(for message: Message, replyAll: Bool, accountID: UUID, session: MailSession?) -> ComposeTarget {
         let isSent = message.mailbox == (session?.folderName(for: "sent", fallback: "Sent") ?? "Sent")
         let fromDefault = isSent ? message.from : message.toAlias
         let toDefault = isSent ? message.toAlias : message.from
 
         var cc = ""
         var quotedBody = ""
-        if let accountID = currentAccount?.id, let raw = cachedRawMessage(for: message, accountID: accountID) {
+        if let raw = cachedRawMessage(for: message, accountID: accountID) {
             let parsed = MIMEParser.parse(raw)
 
             // Standard reply-quoting convention (unlike Forward's plain
@@ -477,13 +526,12 @@ struct ContentView: View {
         return result.joined(separator: "\n")
     }
 
-    private func forwardTarget(for message: Message) -> ComposeTarget {
-        let session = currentSession
+    private func forwardTarget(for message: Message, accountID: UUID, session: MailSession?) -> ComposeTarget {
         let isSent = message.mailbox == (session?.folderName(for: "sent", fallback: "Sent") ?? "Sent")
         let fromDefault = isSent ? message.from : message.toAlias
 
         var body = ""
-        if let accountID = currentAccount?.id, let raw = cachedRawMessage(for: message, accountID: accountID) {
+        if let raw = cachedRawMessage(for: message, accountID: accountID) {
             let parsed = MIMEParser.parse(raw)
             let originalBody = parsed.bestReadableBody() ?? ""
             body = """
@@ -533,6 +581,15 @@ struct ContentView: View {
     }
 
     private func handleMenuNotification(_ notification: Notification) {
+        // In All Messages, selection lives in selectedAccountMessage (a
+        // separate cross-account identity), not the regular per-mailbox
+        // selectedMessages - route based on which one actually applies,
+        // rather than always assuming the regular one.
+        if case .allMessages = sidebarSelection {
+            handleMenuNotificationForAllMessages(notification)
+            return
+        }
+
         guard let session = currentSession else { return }
         let selectedInSession = selectedMessages.compactMap { id in
             session.messages.first(where: { $0.id == id })
@@ -542,11 +599,11 @@ struct ContentView: View {
             let newMessageFrom = currentAccount?.email ?? accountsStore.accounts.first?.email ?? ""
             composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: session.folderName(for: "sent", fallback: "Sent"))
         case .menuReply:
-            if selectedInSession.count == 1 { composeTarget = replyTarget(for: selectedInSession[0], replyAll: false) }
+            if selectedInSession.count == 1, let accountID = currentAccount?.id { composeTarget = replyTarget(for: selectedInSession[0], replyAll: false, accountID: accountID, session: session) }
         case .menuReplyAll:
-            if selectedInSession.count == 1 { composeTarget = replyTarget(for: selectedInSession[0], replyAll: true) }
+            if selectedInSession.count == 1, let accountID = currentAccount?.id { composeTarget = replyTarget(for: selectedInSession[0], replyAll: true, accountID: accountID, session: session) }
         case .menuForward:
-            if selectedInSession.count == 1 { composeTarget = forwardTarget(for: selectedInSession[0]) }
+            if selectedInSession.count == 1, let accountID = currentAccount?.id { composeTarget = forwardTarget(for: selectedInSession[0], accountID: accountID, session: session) }
         case .menuArchive:
             selectedMessages = []
             moveOrDelete(session: session, items: selectedInSession.map { (uid: $0.uid, mailbox: $0.mailbox) }, to: session.folderName(for: "archive", fallback: "Archive"))
@@ -566,6 +623,224 @@ struct ContentView: View {
             showShortcutsHelp = true
         default:
             break
+        }
+    }
+
+    private func handleMenuNotificationForAllMessages(_ notification: Notification) {
+        guard let accountMessage = selectedAccountMessage,
+              let session = sessionManager.session(for: accountMessage.accountID) else {
+            // No cross-account message selected - only these two make
+            // sense with nothing selected.
+            switch notification.name {
+            case .menuComposeNewMessage:
+                let newMessageFrom = accountsStore.accounts.first?.email ?? ""
+                composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: "Sent")
+            case .menuSyncNow:
+                syncAllSessions()
+            case .menuShowShortcutsHelp:
+                showShortcutsHelp = true
+            default:
+                break
+            }
+            return
+        }
+        let message = accountMessage.message
+        switch notification.name {
+        case .menuComposeNewMessage:
+            let newMessageFrom = accountsStore.accounts.first?.email ?? ""
+            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: session.folderName(for: "sent", fallback: "Sent"))
+        case .menuReply:
+            composeTarget = replyTarget(for: message, replyAll: false, accountID: accountMessage.accountID, session: session)
+        case .menuReplyAll:
+            composeTarget = replyTarget(for: message, replyAll: true, accountID: accountMessage.accountID, session: session)
+        case .menuForward:
+            composeTarget = forwardTarget(for: message, accountID: accountMessage.accountID, session: session)
+        case .menuArchive:
+            selectedAccountMessage = nil
+            moveOrDelete(session: session, items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "archive", fallback: "Archive"))
+        case .menuDelete:
+            selectedAccountMessage = nil
+            moveOrDelete(session: session, items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "trash", fallback: "Trash"))
+        case .menuMoveToJunk:
+            selectedAccountMessage = nil
+            moveOrDelete(session: session, items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "junk", fallback: "Spam"))
+        case .menuToggleUnread:
+            session.toggleUnreadForMessages(items: [(uid: message.uid, mailbox: message.mailbox)], markAsUnread: message.isSeen) { }
+        case .menuSyncNow:
+            syncAllSessions()
+        case .menuShowShortcutsHelp:
+            showShortcutsHelp = true
+        default:
+            break
+        }
+    }
+}
+
+/// The merged, genuinely cross-account view - Inbox+Archive+Sent pulled
+/// from every configured account at once, not just the first. Scoped
+/// deliberately smaller than MailboxContentColumn: single-message
+/// selection only (no multi-select bulk actions spanning different
+/// accounts at once), no drag-and-drop between accounts, no search - each
+/// judged not essential for a first version, and each addable later
+/// without disturbing this shape. Reply/Forward/Archive/Delete/Mark as
+/// Read all work directly on whichever message is selected, correctly
+/// routed to that message's own account.
+struct AllMessagesColumn: View {
+    @ObservedObject var sessionManager: AccountSessionManager
+    @ObservedObject var multiSessionObserver: MultiSessionObserver
+    @ObservedObject var accountsStore: AccountsStore
+    @ObservedObject var outbox: OutboxManager
+    @Binding var selectedAccountMessage: AccountMessage?
+    @Binding var composeTarget: ContentView.ComposeTarget?
+    @Binding var redirectTarget: ContentView.RedirectTarget?
+    let onReply: (AccountMessage) -> Void
+    let onReplyAll: (AccountMessage) -> Void
+    let onForward: (AccountMessage) -> Void
+    let onComposeNew: () -> Void
+    let onSyncAllSessions: () -> Void
+
+    @State private var sortOption: SortOption = .dateNewest
+    @State private var showOutboxPopover = false
+
+    private var displayedMessages: [AccountMessage] {
+        var all: [AccountMessage] = []
+        for account in accountsStore.accounts {
+            guard let session = sessionManager.session(for: account.id) else { continue }
+            let mailboxNames = ["INBOX", session.folderName(for: "archive", fallback: "Archive"), session.folderName(for: "sent", fallback: "Sent")]
+            let messages = session.messagesForMailboxes(mailboxNames)
+            all.append(contentsOf: messages.map { AccountMessage(accountID: account.id, accountDisplayName: account.displayName, message: $0) })
+        }
+        return sorted(all)
+    }
+
+    private func sorted(_ messages: [AccountMessage]) -> [AccountMessage] {
+        switch sortOption {
+        case .dateNewest: return messages.sorted { $0.message.date > $1.message.date }
+        case .dateOldest: return messages.sorted { $0.message.date < $1.message.date }
+        case .senderAZ: return messages.sorted { $0.message.from.localizedCaseInsensitiveCompare($1.message.from) == .orderedAscending }
+        case .senderZA: return messages.sorted { $0.message.from.localizedCaseInsensitiveCompare($1.message.from) == .orderedDescending }
+        case .recipientAZ: return messages.sorted { $0.message.toAlias.localizedCaseInsensitiveCompare($1.message.toAlias) == .orderedAscending }
+        case .recipientZA: return messages.sorted { $0.message.toAlias.localizedCaseInsensitiveCompare($1.message.toAlias) == .orderedDescending }
+        }
+    }
+
+    var body: some View {
+        Group {
+            if displayedMessages.isEmpty {
+                Text("No messages found")
+                    .foregroundStyle(.secondary)
+            } else {
+                List(selection: $selectedAccountMessage) {
+                    ForEach(displayedMessages) { accountMessage in
+                        let message = accountMessage.message
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 4) {
+                                if message.isFlaggedSpam {
+                                    Image(systemName: "exclamationmark.shield.fill")
+                                        .foregroundStyle(.orange)
+                                        .font(.caption)
+                                }
+                                Text(message.subject)
+                                    .font(.headline)
+                                    .fontWeight(message.isSeen ? .regular : .semibold)
+                                    .lineLimit(1)
+                            }
+                            HStack {
+                                Text(message.from)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(accountMessage.accountDisplayName)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.secondary.opacity(0.15))
+                                    .clipShape(Capsule())
+                                Text(message.date, format: .dateTime.year().month().day().hour().minute())
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .tag(accountMessage)
+                        .contextMenu {
+                            Button("Reply") { onReply(accountMessage) }
+                            Button("Reply All") { onReplyAll(accountMessage) }
+                            Button("Forward") { onForward(accountMessage) }
+                            Divider()
+                            if let session = sessionManager.session(for: accountMessage.accountID) {
+                                Button("Archive") {
+                                    moveOrDelete(session: session, items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "archive", fallback: "Archive"))
+                                }
+                                Button("Move to Junk") {
+                                    moveOrDelete(session: session, items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "junk", fallback: "Spam"))
+                                }
+                                Button("Delete") {
+                                    moveOrDelete(session: session, items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "trash", fallback: "Trash"))
+                                }
+                                Divider()
+                                Button(message.isSeen ? "Mark as Unread" : "Mark as Read") {
+                                    session.toggleUnreadForMessages(items: [(uid: message.uid, mailbox: message.mailbox)], markAsUnread: message.isSeen) { }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("All Messages (\(displayedMessages.count))")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    onSyncAllSessions()
+                } label: {
+                    Label("Sync", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .help("Sync every account now - checks for new mail and deletions, and refreshes read/unread status")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    onComposeNew()
+                } label: {
+                    Label("Compose", systemImage: "square.and.pencil")
+                }
+                .help("New Message (⌘N)")
+            }
+            if !outbox.items.isEmpty {
+                ToolbarItem(placement: .status) {
+                    Button {
+                        showOutboxPopover = true
+                    } label: {
+                        let sendingCount = outbox.items.filter { $0.status == .sending }.count
+                        let failedCount = outbox.items.filter { if case .failed = $0.status { return true }; return false }.count
+                        if failedCount > 0 {
+                            Label("\(failedCount) failed to send", systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red)
+                        } else if sendingCount > 0 {
+                            HStack(spacing: 4) {
+                                ProgressView().controlSize(.small)
+                                Text("Sending \(sendingCount)…")
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .popover(isPresented: $showOutboxPopover) {
+                        Text("Outbox").font(.headline).padding()
+                    }
+                }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Picker("Sort by", selection: $sortOption) {
+                        ForEach(SortOption.allCases) { option in
+                            Text(option.rawValue).tag(option)
+                        }
+                    }
+                } label: {
+                    Label("Sort", systemImage: "arrow.up.arrow.down")
+                }
+                .help("Sort messages by date, sender, or recipient")
+            }
         }
     }
 }
