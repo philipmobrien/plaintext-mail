@@ -399,25 +399,82 @@ struct ContentView: View {
         let toDefault = isSent ? message.toAlias : message.from
 
         var cc = ""
-        if replyAll, let accountID = currentAccount?.id, let raw = cachedRawMessage(for: message, accountID: accountID) {
+        var quotedBody = ""
+        if let accountID = currentAccount?.id, let raw = cachedRawMessage(for: message, accountID: accountID) {
             let parsed = MIMEParser.parse(raw)
-            let originalTo = extractEmailAddresses(parsed.header("To") ?? "")
-            let originalCc = extractEmailAddresses(parsed.header("Cc") ?? "")
-            let ownAliases = accountsStore.accounts.map { $0.email.lowercased() }
-            let excluded = Set(ownAliases + [toDefault.lowercased()])
-            let ccList = (originalTo + originalCc).filter { !excluded.contains($0.lowercased()) }
-            var seen = Set<String>()
-            let deduped = ccList.filter { seen.insert($0.lowercased()).inserted }
-            cc = deduped.joined(separator: ", ")
+
+            // Standard reply-quoting convention (unlike Forward's plain
+            // separator) - a reply thread can go many rounds, and without
+            // some way to visually separate new text from what came
+            // before, a multi-round conversation turns unreadable.
+            let originalBody = parsed.bestReadableBody() ?? ""
+            // Normalize \r\n and bare \r to \n first - some content uses
+            // bare \r alone as a line ending, which .split(separator: "\n")
+            // doesn't recognize at all. Without this, such a block gets
+            // treated as one single "line" by the split, so it only gets
+            // one "> " prefix at the very start - the embedded \r
+            // characters still render as visual line breaks in the text
+            // editor, making everything past the first line look
+            // unprefixed even though it was technically all one line as
+            // far as the splitting logic was concerned.
+            let normalizedBody = originalBody
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
+            let realignedBody = realignAttributionLines(normalizedBody)
+            let quotedLines = realignedBody.split(separator: "\n", omittingEmptySubsequences: false)
+                .map { "> \($0)" }
+                .joined(separator: "\n")
+            let senderName = parsed.header("From") ?? message.from
+            let dateHeader = parsed.header("Date") ?? ""
+            quotedBody = "\n\nOn \(dateHeader), \(senderName) wrote:\n\(quotedLines)"
+
+            if replyAll {
+                let originalTo = extractEmailAddresses(parsed.header("To") ?? "")
+                let originalCc = extractEmailAddresses(parsed.header("Cc") ?? "")
+                let ownAliases = accountsStore.accounts.map { $0.email.lowercased() }
+                let excluded = Set(ownAliases + [toDefault.lowercased()])
+                let ccList = (originalTo + originalCc).filter { !excluded.contains($0.lowercased()) }
+                var seen = Set<String>()
+                let deduped = ccList.filter { seen.insert($0.lowercased()).inserted }
+                cc = deduped.joined(separator: ", ")
+            }
         }
         return ComposeTarget(
             from: fromDefault,
             to: toDefault,
             cc: cc,
             subject: message.subject.hasPrefix("Re: ") ? message.subject : "Re: \(message.subject)",
-            body: signatureBlock(for: fromDefault),
+            body: signatureBlock(for: fromDefault) + quotedBody,
             sentFolder: session?.folderName(for: "sent", fallback: "Sent") ?? "Sent"
         )
+    }
+
+    /// Within already-quoted content from earlier reply rounds, an
+    /// embedded "On [date], [sender] wrote:" attribution line should sit
+    /// at the quote depth of what it introduces, not what precedes it -
+    /// the conventional way mail clients format nested attributions.
+    /// Best-effort: matches the common "On ... wrote:" phrasing: not every
+    /// possible mail client's exact wording, since there's real variety
+    /// across clients here.
+    private func realignAttributionLines(_ text: String) -> String {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var result: [String] = []
+        for line in lines {
+            var depth = 0
+            var rest = Substring(line)
+            while rest.hasPrefix(">") {
+                depth += 1
+                rest = rest.dropFirst()
+                if rest.hasPrefix(" ") { rest = rest.dropFirst() }
+            }
+            let bareContent = String(rest)
+            let isAttribution = bareContent.range(of: #"^On .+ wrote:$"#, options: .regularExpression) != nil
+            if isAttribution {
+                depth += 1
+            }
+            result.append(String(repeating: "> ", count: depth) + bareContent)
+        }
+        return result.joined(separator: "\n")
     }
 
     private func forwardTarget(for message: Message) -> ComposeTarget {
