@@ -47,7 +47,7 @@ final class ContactsService: ObservableObject {
     /// to work too. No built-in "email contains X" predicate exists, so
     /// this enumerates contacts (lightweight keys only) and filters
     /// client-side, capping the scan once there are enough matches to show.
-    func search(_ query: String) async -> [ContactMatch] {
+    func search(_ query: String) async -> [ContactsService.ContactMatch] {
         guard authorizationGranted else { return [] }
         let trimmedQuery = query.trimmingCharacters(in: .whitespaces).lowercased()
         guard !trimmedQuery.isEmpty else { return [] }

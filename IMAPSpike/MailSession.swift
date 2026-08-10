@@ -8,6 +8,12 @@ import GRDB
 /// message list + local database across multiple mailboxes (INBOX, Sent,
 /// ...) - including per-mailbox deletion reconciliation and automatic
 /// backfill of any envelopes the server has that aren't cached locally yet.
+///
+/// One MailSession per configured account (see AccountSessionManager) -
+/// each gets its own separate database file and .eml cache folder, keyed
+/// by accountID, so a query never needs to filter by account to stay
+/// correct: a session only ever sees its own account's data by
+/// construction.
 @MainActor
 final class MailSession: ObservableObject {
     @Published var connectionState: ConnectionState = .disconnected
@@ -18,6 +24,20 @@ final class MailSession: ObservableObject {
     @Published var discoveredFolders: [String: String] = [:]   // role -> real folder name, e.g. "sent" -> "Sent"
     @Published var allDiscoveredFolders: [DiscoveredFolder] = []
     @Published var isManuallyOffline = false
+
+    let accountID: UUID
+
+    init(accountID: UUID) {
+        self.accountID = accountID
+    }
+
+    private var databasePath: String {
+        FileManager.default.temporaryDirectory.appendingPathComponent("mail-\(accountID.uuidString).sqlite").path
+    }
+
+    private var corpusDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus-\(accountID.uuidString)")
+    }
 
     enum ConnectionState {
         case disconnected, connecting, ready
@@ -36,6 +56,7 @@ final class MailSession: ObservableObject {
     private var selectedOnServer: String?
 
     private var queue: [(uid: Int, mailbox: String, completion: (Result<String, Error>) -> Void)] = []
+    private var pendingMailboxSelection: String?
     private var isProcessingQueue = false
 
     enum SessionError: Error, LocalizedError {
@@ -186,7 +207,7 @@ final class MailSession: ObservableObject {
 
     private func database() throws -> DatabaseQueue {
         if let dbQueue { return dbQueue }
-        let dbPath = FileManager.default.temporaryDirectory.appendingPathComponent("mail.sqlite").path
+        let dbPath = databasePath
         let queue = try DatabaseSetup.makeDatabase(at: dbPath)
         dbQueue = queue
         return queue
@@ -227,7 +248,7 @@ final class MailSession: ObservableObject {
                 Task { @MainActor in
                     self?.connectionState = .ready
                     self?.discoverFolders {
-                        self?.selectMailbox(initialMailbox)
+                        self?.selectMailbox(initialMailbox, isAutomaticDefault: true)
                     }
                 }
             }
@@ -346,9 +367,21 @@ final class MailSession: ObservableObject {
     /// already selected), checks UIDVALIDITY, reconciles deletions, fetches
     /// any envelopes the server has that aren't cached locally yet, then
     /// loads the message list for that mailbox.
-    func selectMailbox(_ mailbox: String) {
+    func selectMailbox(_ mailbox: String, isAutomaticDefault: Bool = false) {
         guard connectionState == .ready, let client else { return }
-        guard !isSelectingMailbox, !isProcessingQueue else { return } // don't overlap with another in-flight operation
+        guard !isSelectingMailbox, !isProcessingQueue else {
+            // An automatic default selection (connect()'s own initial
+            // "open INBOX" call) must never overwrite a genuine, more
+            // recent user-requested selection that's already queued here -
+            // that exact collision was silently swapping a user's clicked
+            // mailbox back to INBOX whenever the two happened to race.
+            // A non-automatic request always queues normally regardless.
+            if isAutomaticDefault, pendingMailboxSelection != nil {
+                return
+            }
+            pendingMailboxSelection = mailbox
+            return
+        }
 
         guard mailbox != selectedOnServer else {
             currentMailbox = mailbox
@@ -364,6 +397,7 @@ final class MailSession: ObservableObject {
                     self?.lastError = SessionError.selectFailed(reply.text).localizedDescription
                     self?.isSyncing = false
                     self?.isSelectingMailbox = false
+                    self?.processQueueIfNeeded()
                     return
                 }
                 self?.selectedOnServer = mailbox
@@ -495,7 +529,7 @@ final class MailSession: ObservableObject {
                 try Message.filter(Column("mailbox") == mailbox && toDelete.contains(Column("uid"))).deleteAll(db)
             }
 
-            let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus")
+            let corpusDir = self.corpusDirectory
             for uid in toDelete {
                 try? FileManager.default.removeItem(at: corpusDir.appendingPathComponent("\(mailbox)-\(uid).eml"))
             }
@@ -748,7 +782,7 @@ final class MailSession: ObservableObject {
                         try Message.filter(Column("mailbox") == sourceMailbox && Column("uid") == uid).deleteAll(db)
                     }
 
-                    let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus")
+                    let corpusDir = self.corpusDirectory
                     let oldFile = corpusDir.appendingPathComponent("\(sourceMailbox)-\(uid).eml")
 
                     if let newUID = reply.copyUID(), let original {
@@ -852,7 +886,7 @@ final class MailSession: ObservableObject {
                             try Message.filter(Column("mailbox") == mailbox).deleteAll(db)
                         }
                     }
-                    let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus")
+                    let corpusDir = self.corpusDirectory
                     if let files = try? FileManager.default.contentsOfDirectory(at: corpusDir, includingPropertiesForKeys: nil) {
                         for file in files where file.lastPathComponent.hasPrefix("\(mailbox)-") {
                             try? FileManager.default.removeItem(at: file)
@@ -894,8 +928,8 @@ final class MailSession: ObservableObject {
                             try Message.filter(Column("mailbox") == mailbox).deleteAll(db)
                         }
                     }
-                    let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus")
-                    if let files = try? FileManager.default.contentsOfDirectory(at: corpusDir, includingPropertiesForKeys: nil) {
+                    if let corpusDir = self?.corpusDirectory,
+                       let files = try? FileManager.default.contentsOfDirectory(at: corpusDir, includingPropertiesForKeys: nil) {
                         for file in files where file.lastPathComponent.hasPrefix("\(mailbox)-") {
                             try? FileManager.default.removeItem(at: file)
                         }
@@ -966,9 +1000,10 @@ final class MailSession: ObservableObject {
                             try Message.filter(Column("mailbox") == mailbox && uids.contains(Column("uid"))).deleteAll(db)
                         }
                     }
-                    let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus")
-                    for uid in uids {
-                        try? FileManager.default.removeItem(at: corpusDir.appendingPathComponent("\(mailbox)-\(uid).eml"))
+                    if let corpusDir = self?.corpusDirectory {
+                        for uid in uids {
+                            try? FileManager.default.removeItem(at: corpusDir.appendingPathComponent("\(mailbox)-\(uid).eml"))
+                        }
                     }
                     self?.loadMessagesFromDB()
                     completion(.success(()))
@@ -989,6 +1024,15 @@ final class MailSession: ObservableObject {
     }
 
     private func processQueueIfNeeded() {
+        // A mailbox switch requested while busy takes priority over
+        // continuing background body-fetches - the user is actively
+        // waiting to see a different mailbox, not for those to finish.
+        if let pending = pendingMailboxSelection, !isSelectingMailbox, !isProcessingQueue, pending != currentMailbox {
+            pendingMailboxSelection = nil
+            selectMailbox(pending)
+            return
+        }
+
         guard !isProcessingQueue, !isSelectingMailbox, connectionState == .ready, let client = client, !queue.isEmpty else { return }
         isProcessingQueue = true
 

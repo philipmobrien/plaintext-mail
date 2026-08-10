@@ -21,6 +21,7 @@ final class OutboxManager: ObservableObject {
         let smtpPort: Int
         let user: String
         let password: String
+        let accountID: UUID
         let sentFolder: String
         let prebuiltRawMessage: String?
         let from: String
@@ -42,6 +43,7 @@ final class OutboxManager: ObservableObject {
     private var isProcessing = false
 
     func enqueue(
+        accountID: UUID,
         imapHost: String, imapPort: Int, smtpHost: String, smtpPort: Int, user: String, password: String,
         sentFolder: String,
         from: String, to: String, cc: String, subject: String, markdownBody: String,
@@ -53,6 +55,7 @@ final class OutboxManager: ObservableObject {
             toPreview: to,
             status: .sending,
             imapHost: imapHost, imapPort: imapPort, smtpHost: smtpHost, smtpPort: smtpPort, user: user, password: password,
+            accountID: accountID,
             sentFolder: sentFolder,
             prebuiltRawMessage: prebuiltRawMessage,
             from: from, to: to, cc: cc, subject: subject, markdownBody: markdownBody,
@@ -80,6 +83,7 @@ final class OutboxManager: ObservableObject {
         let item = items[index]
         let session = ComposeSession()
         session.send(
+            accountID: item.accountID,
             imapHost: item.imapHost, imapPort: item.imapPort, smtpHost: item.smtpHost, smtpPort: item.smtpPort,
             user: item.user, password: item.password,
             sentFolder: item.sentFolder,

@@ -33,6 +33,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Account.swift,
+				AccountSessionManager.swift,
 				AccountsStore.swift,
 				AddAccountView.swift,
 				AppNotifications.swift,
@@ -62,6 +63,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Account.swift,
+				AccountSessionManager.swift,
 				AccountsStore.swift,
 				AddAccountView.swift,
 				AppNotifications.swift,

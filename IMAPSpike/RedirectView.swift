@@ -128,6 +128,7 @@ struct RedirectView: View {
         let rawRedirect = RedirectComposer.buildRedirect(originalRaw: originalRaw, from: from, to: to)
 
         outbox.enqueue(
+            accountID: account.id,
             imapHost: account.imapHost, imapPort: account.imapPort,
             smtpHost: account.smtpHost, smtpPort: account.smtpPort,
             user: account.email, password: password,

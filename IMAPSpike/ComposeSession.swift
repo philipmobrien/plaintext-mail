@@ -46,6 +46,7 @@ final class ComposeSession: ObservableObject {
     }
 
     func send(
+        accountID: UUID,
         imapHost: String, imapPort: Int, smtpHost: String, smtpPort: Int, user: String, password: String,
         sentFolder: String,
         from: String, to: String, cc: String, subject: String, markdownBody: String,
@@ -87,7 +88,7 @@ final class ComposeSession: ObservableObject {
                             self.finishSMTP(client, result, completion)
 
                             if case .success = result {
-                                self.appendToSent(host: imapHost, port: imapPort, user: user, password: password, sentFolder: sentFolder, rawMessage: rawMessage)
+                                self.appendToSent(accountID: accountID, host: imapHost, port: imapPort, user: user, password: password, sentFolder: sentFolder, rawMessage: rawMessage)
                             }
                         }
                     }
@@ -162,7 +163,7 @@ final class ComposeSession: ObservableObject {
     /// connection. Failure here doesn't affect the already-successful send -
     /// the message went out either way - so this only logs, never surfaces
     /// as a user-facing error.
-    private func appendToSent(host: String, port: Int, user: String, password: String, sentFolder: String, rawMessage: String) {
+    private func appendToSent(accountID: UUID, host: String, port: Int, user: String, password: String, sentFolder: String, rawMessage: String) {
         let portValue = NWEndpoint.Port(rawValue: UInt16(port)) ?? 993
         let client = IMAPClient(host: host, port: portValue)
         client.connect {
@@ -180,7 +181,7 @@ final class ComposeSession: ObservableObject {
 
                     Task { @MainActor in
                         if let uid = reply.appendUID() {
-                            self.insertSentMessageLocally(uid: uid, mailbox: sentFolder, rawMessage: rawMessage)
+                            self.insertSentMessageLocally(accountID: accountID, uid: uid, mailbox: sentFolder, rawMessage: rawMessage)
                         }
                     }
                 }
@@ -188,9 +189,9 @@ final class ComposeSession: ObservableObject {
         }
     }
 
-    private func insertSentMessageLocally(uid: Int, mailbox: String, rawMessage: String) {
+    private func insertSentMessageLocally(accountID: UUID, uid: Int, mailbox: String, rawMessage: String) {
         guard let dbQueue = try? DatabaseSetup.makeDatabase(
-            at: FileManager.default.temporaryDirectory.appendingPathComponent("mail.sqlite").path
+            at: FileManager.default.temporaryDirectory.appendingPathComponent("mail-\(accountID.uuidString).sqlite").path
         ) else { return }
 
         let parsed = MIMEParser.parse(rawMessage)
@@ -209,7 +210,7 @@ final class ComposeSession: ObservableObject {
         )
         _ = try? dbQueue.write { db in try message.insert(db) }
 
-        let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus")
+        let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus-\(accountID.uuidString)")
         try? FileManager.default.createDirectory(at: corpusDir, withIntermediateDirectories: true)
         try? rawMessage.write(to: corpusDir.appendingPathComponent("\(mailbox)-\(uid).eml"), atomically: true, encoding: .utf8)
     }

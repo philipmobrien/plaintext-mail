@@ -305,6 +305,7 @@ struct ComposeView: View {
               let password = accountsStore.password(for: account) else { return }
 
         outbox.enqueue(
+            accountID: account.id,
             imapHost: account.imapHost, imapPort: account.imapPort,
             smtpHost: account.smtpHost, smtpPort: account.smtpPort,
             user: account.email, password: password,

@@ -4,14 +4,17 @@ import AppKit
 import Combine
 
 /// What's currently selected in the sidebar - either a real IMAP mailbox
-/// or a locally-defined smart folder. Needed because they behave quite
+/// or a locally-defined smart folder, both scoped to a specific account
+/// now that multiple accounts exist. Needed because they behave quite
 /// differently: selecting a mailbox does a real IMAP SELECT + sync,
 /// selecting a smart folder just runs a local SQL query across whichever
-/// mailboxes it watches.
+/// mailboxes it watches - and because each account has its own separate
+/// database, a smart folder's numeric ID is only unique within its own
+/// account, hence carrying accountID alongside it here too.
 enum SidebarSelection: Hashable {
     case allMessages
-    case mailbox(String)
-    case smartFolder(Int64)
+    case mailbox(accountID: UUID, name: String)
+    case smartFolder(accountID: UUID, id: Int64)
 }
 
 enum SortOption: String, CaseIterable, Identifiable {
@@ -25,14 +28,32 @@ enum SortOption: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// Shared by ContentView's menu-bar bridge (keyboard shortcuts, which can
+/// fire regardless of which view currently has focus) and
+/// MailboxContentColumn's own row-level context menus/drag-and-drop - a
+/// free function taking `session` explicitly, rather than a method on
+/// either type, so both call the exact same logic with no duplication.
+/// Moves items to a destination mailbox, except when everything's already
+/// sitting in Trash and the destination IS Trash - that's a permanent
+/// delete (moving Trash to itself is rejected as a no-op by IMAP anyway).
+func moveOrDelete(session: MailSession, items: [(uid: Int, mailbox: String)], to destinationMailbox: String) {
+    guard !items.isEmpty else { return }
+    let trashFolder = session.folderName(for: "trash", fallback: "Trash")
+    if destinationMailbox == trashFolder, items.allSatisfy({ $0.mailbox == trashFolder }) {
+        session.permanentlyDeleteMessages(uids: items.map { $0.uid }) { _ in }
+    } else {
+        session.moveMessages(items: items, to: destinationMailbox) { }
+    }
+}
+
 struct ContentView: View {
-    @StateObject private var session = MailSession()
+    @StateObject private var sessionManager = AccountSessionManager()
     @StateObject private var accountsStore = AccountsStore()
     @StateObject private var outbox = OutboxManager()
     @State private var selectedMessages: Set<Message.ID> = []
     @State private var composeTarget: ComposeTarget?
     @State private var redirectTarget: RedirectTarget?
-    @State private var sidebarSelection: SidebarSelection? = .mailbox("INBOX")
+    @State private var sidebarSelection: SidebarSelection?
     @State private var showEmptyTrashConfirm = false
     @State private var searchQuery = ""
     @State private var smartFolderSheetTarget: SmartFolderSheetTarget?
@@ -43,12 +64,12 @@ struct ContentView: View {
     @State private var dropTargetedMailbox: String?
 
     enum SmartFolderSheetTarget: Identifiable {
-        case new
-        case edit(SmartFolder)
+        case new(accountID: UUID)
+        case edit(accountID: UUID, folder: SmartFolder)
         var id: String {
             switch self {
-            case .new: return "new"
-            case .edit(let f): return "edit-\(f.id ?? -1)"
+            case .new(let accountID): return "new-\(accountID)"
+            case .edit(let accountID, let f): return "edit-\(accountID)-\(f.id ?? -1)"
             }
         }
     }
@@ -75,14 +96,45 @@ struct ContentView: View {
     /// until discovery completes (or if it ever fails) - identical to the
     /// old hardcoded values for Runbox specifically, so nothing changes
     /// visually for that account, but genuinely correct for any other.
-    private var mailboxes: [(role: String, name: String, label: String, icon: String)] {
-        [
+    /// Now takes an account explicitly, since each account has its own
+    /// session and its own discovered folder names.
+    private func mailboxes(for accountID: UUID) -> [(role: String, name: String, label: String, icon: String)] {
+        guard let session = sessionManager.session(for: accountID) else { return [] }
+        return [
             (role: "inbox", name: "INBOX", label: "Inbox", icon: "tray"),
             (role: "sent", name: session.folderName(for: "sent", fallback: "Sent"), label: "Sent", icon: "paperplane"),
             (role: "archive", name: session.folderName(for: "archive", fallback: "Archive"), label: "Archive", icon: "archivebox"),
             (role: "junk", name: session.folderName(for: "junk", fallback: "Spam"), label: "Spam", icon: "nosign"),
             (role: "trash", name: session.folderName(for: "trash", fallback: "Trash"), label: "Trash", icon: "trash"),
         ]
+    }
+
+    /// The session matching whatever's currently selected - used for
+    /// routing actions (menu-bar shortcuts, sidebar's own onChange) to the
+    /// right account. NOT used for display any more - MailboxContentColumn
+    /// holds its own direct @ObservedObject reference for that, since
+    /// routing actions correctly doesn't require reactive observation the
+    /// way rendering does. "All Messages" is deliberately scoped to the
+    /// first configured account for now - a genuinely cross-account
+    /// unified view is separate, later work.
+    private var currentSession: MailSession? {
+        switch sidebarSelection {
+        case .mailbox(let accountID, _), .smartFolder(let accountID, _):
+            return sessionManager.session(for: accountID)
+        case .allMessages, nil:
+            guard let firstAccount = accountsStore.accounts.first else { return nil }
+            return sessionManager.session(for: firstAccount.id)
+        }
+    }
+
+    /// The account matching currentSession, when there is one.
+    private var currentAccount: Account? {
+        switch sidebarSelection {
+        case .mailbox(let accountID, _), .smartFolder(let accountID, _):
+            return accountsStore.accounts.first(where: { $0.id == accountID })
+        case .allMessages, nil:
+            return accountsStore.accounts.first
+        }
     }
 
     var body: some View {
@@ -98,67 +150,71 @@ struct ContentView: View {
             List(selection: $sidebarSelection) {
                 Label("All Messages", systemImage: "tray.full")
                     .tag(SidebarSelection.allMessages)
-                Section("Mailboxes") {
-                    ForEach(mailboxes, id: \.role) { mailbox in
-                        Label(mailbox.label, systemImage: mailbox.icon)
-                            .tag(SidebarSelection.mailbox(mailbox.name))
-                            .listRowBackground(
-                                dropTargetedMailbox == mailbox.name ? Color.accentColor.opacity(0.2) : nil
-                            )
-                            .dropDestination(for: String.self) { ids, _ in
-                                handleDrop(ids: ids, to: mailbox.name)
-                                return true
-                            } isTargeted: { targeted in
-                                dropTargetedMailbox = targeted ? mailbox.name : nil
-                            }
-                            .contextMenu {
-                                if mailbox.role == "trash" {
-                                    Button("Empty Trash", role: .destructive) {
-                                        showEmptyTrashConfirm = true
-                                    }
-                                } else if mailbox.role == "junk" {
-                                    Button("Move All to Trash") {
-                                        let trashFolder = mailboxes.first(where: { $0.role == "trash" })?.name ?? "Trash"
-                                        session.moveAllMessages(from: mailbox.name, to: trashFolder) { }
-                                    }
+                ForEach(accountsStore.accounts) { account in
+                    Section(account.displayName) {
+                        ForEach(mailboxes(for: account.id), id: \.role) { mailbox in
+                            Label(mailbox.label, systemImage: mailbox.icon)
+                                .tag(SidebarSelection.mailbox(accountID: account.id, name: mailbox.name))
+                                .listRowBackground(
+                                    dropTargetedMailbox == mailbox.name ? Color.accentColor.opacity(0.2) : nil
+                                )
+                                .dropDestination(for: String.self) { ids, _ in
+                                    handleDrop(ids: ids, to: mailbox.name, accountID: account.id)
+                                    return true
+                                } isTargeted: { targeted in
+                                    dropTargetedMailbox = targeted ? mailbox.name : nil
                                 }
-                                // No context menu items for other mailboxes -
-                                // deliberately scoped to just these two.
-                            }
-                    }
-                }
-                Section("Smart Folders") {
-                    ForEach(session.smartFolders) { folder in
-                        Label(folder.name, systemImage: "gearshape.2")
-                            .tag(SidebarSelection.smartFolder(folder.id ?? -1))
-                            .contextMenu {
-                                Button("Edit…") {
-                                    smartFolderSheetTarget = .edit(folder)
-                                }
-                                Button("Delete", role: .destructive) {
-                                    session.deleteSmartFolder(folder)
-                                    if sidebarSelection == .smartFolder(folder.id ?? -1) {
-                                        sidebarSelection = .mailbox("INBOX")
+                                .contextMenu {
+                                    if mailbox.role == "trash" {
+                                        Button("Empty Trash", role: .destructive) {
+                                            showEmptyTrashConfirm = true
+                                        }
+                                    } else if mailbox.role == "junk" {
+                                        Button("Move All to Trash") {
+                                            let trashFolder = mailboxes(for: account.id).first(where: { $0.role == "trash" })?.name ?? "Trash"
+                                            sessionManager.session(for: account.id)?.moveAllMessages(from: mailbox.name, to: trashFolder) { }
+                                        }
                                     }
+                                    // No context menu items for other mailboxes -
+                                    // deliberately scoped to just these two.
                                 }
+                        }
+                        if let session = sessionManager.session(for: account.id), !session.smartFolders.isEmpty {
+                            ForEach(session.smartFolders) { folder in
+                                Label(folder.name, systemImage: "gearshape.2")
+                                    .tag(SidebarSelection.smartFolder(accountID: account.id, id: folder.id ?? -1))
+                                    .contextMenu {
+                                        Button("Edit…") {
+                                            smartFolderSheetTarget = .edit(accountID: account.id, folder: folder)
+                                        }
+                                        Button("Delete", role: .destructive) {
+                                            session.deleteSmartFolder(folder)
+                                            if sidebarSelection == .smartFolder(accountID: account.id, id: folder.id ?? -1) {
+                                                sidebarSelection = .mailbox(accountID: account.id, name: "INBOX")
+                                            }
+                                        }
+                                    }
                             }
-                    }
-                    Button {
-                        smartFolderSheetTarget = .new
-                    } label: {
-                        Label("New Smart Folder…", systemImage: "plus")
+                        }
+                        Button {
+                            smartFolderSheetTarget = .new(accountID: account.id)
+                        } label: {
+                            Label("New Smart Folder…", systemImage: "plus")
+                        }
                     }
                 }
             }
             .onChange(of: sidebarSelection) { _, newValue in
                 selectedMessages = []
                 searchQuery = ""
-                session.clearSearch()
+                currentSession?.clearSearch()
                 switch newValue {
-                case .mailbox(let name):
-                    session.selectMailbox(name)
+                case .mailbox(let accountID, let name):
+                    sessionManager.session(for: accountID)?.selectMailbox(name)
                 case .allMessages:
-                    session.syncMultipleMailboxes(allMessagesMailboxes) { }
+                    if let account = accountsStore.accounts.first, let session = sessionManager.session(for: account.id) {
+                        session.syncMultipleMailboxes(allMessagesMailboxes(for: account.id)) { }
+                    }
                 case .smartFolder, .none:
                     break
                 }
@@ -166,163 +222,55 @@ struct ContentView: View {
             .navigationTitle("Mailboxes")
             .sheet(item: $smartFolderSheetTarget) { target in
                 switch target {
-                case .new:
-                    SmartFolderFormView(session: session, existingFolder: nil)
-                case .edit(let folder):
-                    SmartFolderFormView(session: session, existingFolder: folder)
+                case .new(let accountID):
+                    if let session = sessionManager.session(for: accountID) {
+                        SmartFolderFormView(session: session, existingFolder: nil)
+                    }
+                case .edit(let accountID, let folder):
+                    if let session = sessionManager.session(for: accountID) {
+                        SmartFolderFormView(session: session, existingFolder: folder)
+                    }
                 }
             }
         } content: {
             Group {
-                if displayedMessages.isEmpty {
-                    Text(session.searchResults != nil ? "No matching messages" : "No messages found")
-                        .foregroundStyle(.secondary)
+                if let session = currentSession, let account = currentAccount {
+                    MailboxContentColumn(
+                        session: session,
+                        accountsStore: accountsStore,
+                        outbox: outbox,
+                        selectedMessages: $selectedMessages,
+                        composeTarget: $composeTarget,
+                        redirectTarget: $redirectTarget,
+                        searchQuery: $searchQuery,
+                        sortOption: $sortOption,
+                        showEmptyTrashConfirm: $showEmptyTrashConfirm,
+                        sidebarSelection: sidebarSelection,
+                        currentAccount: account,
+                        mailboxes: mailboxes(for: account.id),
+                        allMessagesMailboxes: allMessagesMailboxes(for: account.id),
+                        onReply: { message in composeTarget = replyTarget(for: message, replyAll: false) },
+                        onReplyAll: { message in composeTarget = replyTarget(for: message, replyAll: true) },
+                        onForward: { message in composeTarget = forwardTarget(for: message) },
+                        onComposeNew: {
+                            let newMessageFrom = currentAccount?.email ?? accountsStore.accounts.first?.email ?? ""
+                            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: currentSession?.folderName(for: "sent", fallback: "Sent") ?? "Sent")
+                        },
+                        onSyncAllSessions: { syncAllSessions() }
+                    )
                 } else {
-                    List(displayedMessages, selection: $selectedMessages) { message in
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 4) {
-                                if message.isFlaggedSpam {
-                                    Image(systemName: "exclamationmark.shield.fill")
-                                        .foregroundStyle(.orange)
-                                        .font(.caption)
-                                        .help("Flagged as spam by Runbox's own filter" + (message.spamScore.map { " (score: \(String(format: "%.1f", $0)))" } ?? ""))
-                                }
-                                Text(message.subject)
-                                    .font(.headline)
-                                    .fontWeight(message.isSeen ? .regular : .semibold)
-                                    .lineLimit(1)
-                            }
-                            HStack {
-                                Text(message.from)
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                                Text(message.date, format: .dateTime.year().month().day().hour().minute())
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .tag(message.id)
-                        .draggable(message.id)
-                        .contextMenu {
-                            Button("Reply") { composeTarget = replyTarget(for: message, replyAll: false) }
-                            Button("Reply All") { composeTarget = replyTarget(for: message, replyAll: true) }
-                            Button("Forward") { composeTarget = forwardTarget(for: message) }
-                            Divider()
-                            Button("Archive") {
-                                moveOrDelete(items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "archive", fallback: "Archive"))
-                            }
-                            Button("Move to Junk") {
-                                moveOrDelete(items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "junk", fallback: "Spam"))
-                            }
-                            Button("Delete") {
-                                moveOrDelete(items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "trash", fallback: "Trash"))
-                            }
-                            Divider()
-                            Button(message.isSeen ? "Mark as Unread" : "Mark as Read") {
-                                session.toggleUnreadForMessages(
-                                    items: [(uid: message.uid, mailbox: message.mailbox)],
-                                    markAsUnread: message.isSeen
-                                ) { }
-                            }
-                        }
-                    }
+                    Text("No messages found")
+                        .foregroundStyle(.secondary)
                 }
             }
-            .searchable(text: $searchQuery, placement: .toolbar, prompt: "Search \(currentMailboxLabel)")
-            .onSubmit(of: .search) {
-                session.search(query: searchQuery)
+            .sheet(isPresented: $showShortcutsHelp) {
+                ShortcutsHelpView()
             }
-            .onChange(of: searchQuery) { _, newValue in
-                if newValue.isEmpty { session.clearSearch() }
+            .sheet(isPresented: $showEditSignatures) {
+                EditSignaturesView(accountsStore: accountsStore)
             }
-            .navigationTitle(contentTitle)
-            .toolbar {
-                ToolbarItem(placement: .status) {
-                    connectionStatusView
-                }
-                if !outbox.items.isEmpty {
-                    ToolbarItem(placement: .status) {
-                        outboxIndicator
-                    }
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        session.syncNow()
-                    } label: {
-                        if session.isSyncing {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Label("Sync", systemImage: "arrow.triangle.2.circlepath")
-                        }
-                    }
-                    .help("Sync this mailbox now - checks for new mail and deletions, and refreshes read/unread status")
-                    .disabled(session.connectionState != .ready || session.isSyncing)
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        let newMessageFrom = accountsStore.accounts.first?.email ?? ""
-                        composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: session.folderName(for: "sent", fallback: "Sent"))
-                    } label: {
-                        Label("Compose", systemImage: "square.and.pencil")
-                    }
-                    .help("New Message (⌘N)")
-                    // Cmd+N is owned by the real menu bar now (MailAppApp.swift's
-                    // CommandGroup replacing .newItem) - declaring it here too
-                    // would risk a double-registration conflict.
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        showEditSignatures = true
-                    } label: {
-                        Label("Edit Signatures", systemImage: "signature")
-                    }
-                    .help("Edit signatures for your accounts")
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        showAddAccount = true
-                    } label: {
-                        Label("Add Account", systemImage: "person.badge.plus")
-                    }
-                    .help("Add another mail account")
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    Menu {
-                        Picker("Sort by", selection: $sortOption) {
-                            ForEach(SortOption.allCases) { option in
-                                Text(option.rawValue).tag(option)
-                            }
-                        }
-                    } label: {
-                        Label("Sort", systemImage: "arrow.up.arrow.down")
-                    }
-                    .help("Sort messages by date, sender, or recipient")
-                }
-                let trashFolder = session.folderName(for: "trash", fallback: "Trash")
-                if session.currentMailbox == trashFolder, sidebarSelection == .mailbox(trashFolder) {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button(role: .destructive) {
-                            showEmptyTrashConfirm = true
-                        } label: {
-                            Label("Empty Trash", systemImage: "trash.slash")
-                        }
-                        .disabled(session.messages.isEmpty)
-                        .help("Permanently delete everything in Trash - this cannot be undone")
-                    }
-                }
-            }
-            .confirmationDialog(
-                "Permanently delete all messages in Trash?",
-                isPresented: $showEmptyTrashConfirm,
-                titleVisibility: .visible
-            ) {
-                Button("Empty Trash", role: .destructive) {
-                    session.emptyTrash(mailbox: session.folderName(for: "trash", fallback: "Trash")) { _ in }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("This cannot be undone.")
+            .sheet(isPresented: $showAddAccount) {
+                AddAccountView(accountsStore: accountsStore)
             }
             .sheet(item: $composeTarget) { target in
                 ComposeView(outbox: outbox, accountsStore: accountsStore, from: target.from, to: target.to, cc: target.cc, subject: target.subject, messageBody: target.body, sentFolder: target.sentFolder)
@@ -343,30 +291,28 @@ struct ContentView: View {
             // checker past its complexity limit ("unable to type-check this
             // expression in reasonable time"), and this is cleaner besides.
             .onReceive(menuNotificationPublisher) { handleMenuNotification($0) }
-            .sheet(isPresented: $showShortcutsHelp) {
-                ShortcutsHelpView()
-            }
-            .sheet(isPresented: $showEditSignatures) {
-                EditSignaturesView(accountsStore: accountsStore)
-            }
-            .sheet(isPresented: $showAddAccount) {
-                AddAccountView(accountsStore: accountsStore)
-            }
             .task {
-                session.loadSmartFolders()
-                connectSession()
+                syncAllSessions()
+                if sidebarSelection == nil, let firstAccount = accountsStore.accounts.first {
+                    sidebarSelection = .mailbox(accountID: firstAccount.id, name: "INBOX")
+                }
+            }
+            .onChange(of: accountsStore.accounts) { _, _ in
+                syncAllSessions()
             }
         } detail: {
             if selectedMessages.count == 1, let id = selectedMessages.first,
-               let message = displayedMessages.first(where: { $0.id == id }) {
+               let accountID = currentAccount?.id, let session = currentSession,
+               let message = findSelectedMessage(id: id, session: session) {
                 MessageDetailView(
                     message: message,
+                    accountID: accountID,
                     session: session,
                     onReply: { composeTarget = replyTarget(for: message, replyAll: false) },
                     onReplyAll: { composeTarget = replyTarget(for: message, replyAll: true) },
                     onForward: { composeTarget = forwardTarget(for: message) },
                     onRedirect: {
-                        if let raw = cachedRawMessage(for: message) {
+                        if let raw = cachedRawMessage(for: message, accountID: accountID) {
                             let isSent = message.mailbox == session.folderName(for: "sent", fallback: "Sent")
                             let defaultFrom = isSent ? message.from : message.toAlias
                             redirectTarget = RedirectTarget(
@@ -388,28 +334,227 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Search / display helpers
+    // MARK: - Helpers needed by the sidebar itself and by construction of
+    // the content/detail columns - these route to the right session by
+    // account ID, which is correct even without reactive observation,
+    // since they're called fresh at the moment of use, not cached.
 
-    /// Smart folder results (local query) when a smart folder is selected,
-    /// search results when a search is active, otherwise the normal
-    /// mailbox list.
-    private var allMessagesMailboxes: [String] {
-        ["INBOX", session.folderName(for: "archive", fallback: "Archive"), session.folderName(for: "sent", fallback: "Sent")]
+    /// Finds a selected message by ID across whichever source is currently
+    /// active - search results, a smart folder's broader query, or the
+    /// plain current-mailbox list - mirroring the same branching
+    /// MailboxContentColumn uses for its own displayedMessages, so the
+    /// detail pane can correctly find a message regardless of which view
+    /// it was selected from, not just the current mailbox.
+    private func findSelectedMessage(id: Message.ID, session: MailSession) -> Message? {
+        if let searchResults = session.searchResults {
+            return searchResults.first(where: { $0.id == id })
+        }
+        if case .allMessages = sidebarSelection, let accountID = currentAccount?.id {
+            return session.messagesForMailboxes(allMessagesMailboxes(for: accountID)).first(where: { $0.id == id })
+        }
+        if case .smartFolder(_, let folderID) = sidebarSelection,
+           let folder = session.smartFolders.first(where: { $0.id == folderID }) {
+            return session.messagesForSmartFolder(folder).first(where: { $0.id == id })
+        }
+        return session.messages.first(where: { $0.id == id })
     }
 
-    /// Search results take priority whenever a search is active, regardless
-    /// of what's selected in the sidebar - otherwise a search performed
-    /// while a smart folder happened to be open would be silently
-    /// discarded in favour of the smart folder's own contents. Sort is
-    /// applied last, uniformly, regardless of which of these sources fed
-    /// the list.
+    private func allMessagesMailboxes(for accountID: UUID) -> [String] {
+        guard let session = sessionManager.session(for: accountID) else { return ["INBOX"] }
+        return ["INBOX", session.folderName(for: "archive", fallback: "Archive"), session.folderName(for: "sent", fallback: "Sent")]
+    }
+
+    private func handleDrop(ids: [String], to destinationMailbox: String, accountID: UUID) {
+        let items: [(uid: Int, mailbox: String)] = ids.compactMap { idString in
+            let parts = idString.split(separator: "|", maxSplits: 1)
+            guard parts.count == 2, let uid = Int(parts[1]) else { return nil }
+            return (uid: uid, mailbox: String(parts[0]))
+        }
+        for item in items {
+            selectedMessages.remove("\(item.mailbox)|\(item.uid)")
+        }
+        guard let session = sessionManager.session(for: accountID) else { return }
+        moveOrDelete(session: session, items: items, to: destinationMailbox)
+    }
+
+    private func signatureBlock(for email: String) -> String {
+        guard let account = accountsStore.accounts.first(where: { $0.email == email }),
+              !account.signature.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return ""
+        }
+        return "\n\n-- \n\(account.signature)\n"
+    }
+
+    private func syncAllSessions() {
+        sessionManager.syncSessions(accounts: accountsStore.accounts, passwordLookup: { accountsStore.password(for: $0) })
+        for session in sessionManager.sessions.values {
+            session.loadSmartFolders()
+        }
+    }
+
+    private func replyTarget(for message: Message, replyAll: Bool) -> ComposeTarget {
+        let session = currentSession
+        let isSent = message.mailbox == (session?.folderName(for: "sent", fallback: "Sent") ?? "Sent")
+        let fromDefault = isSent ? message.from : message.toAlias
+        let toDefault = isSent ? message.toAlias : message.from
+
+        var cc = ""
+        if replyAll, let accountID = currentAccount?.id, let raw = cachedRawMessage(for: message, accountID: accountID) {
+            let parsed = MIMEParser.parse(raw)
+            let originalTo = extractEmailAddresses(parsed.header("To") ?? "")
+            let originalCc = extractEmailAddresses(parsed.header("Cc") ?? "")
+            let ownAliases = accountsStore.accounts.map { $0.email.lowercased() }
+            let excluded = Set(ownAliases + [toDefault.lowercased()])
+            let ccList = (originalTo + originalCc).filter { !excluded.contains($0.lowercased()) }
+            var seen = Set<String>()
+            let deduped = ccList.filter { seen.insert($0.lowercased()).inserted }
+            cc = deduped.joined(separator: ", ")
+        }
+        return ComposeTarget(
+            from: fromDefault,
+            to: toDefault,
+            cc: cc,
+            subject: message.subject.hasPrefix("Re: ") ? message.subject : "Re: \(message.subject)",
+            body: signatureBlock(for: fromDefault),
+            sentFolder: session?.folderName(for: "sent", fallback: "Sent") ?? "Sent"
+        )
+    }
+
+    private func forwardTarget(for message: Message) -> ComposeTarget {
+        let session = currentSession
+        let isSent = message.mailbox == (session?.folderName(for: "sent", fallback: "Sent") ?? "Sent")
+        let fromDefault = isSent ? message.from : message.toAlias
+
+        var body = ""
+        if let accountID = currentAccount?.id, let raw = cachedRawMessage(for: message, accountID: accountID) {
+            let parsed = MIMEParser.parse(raw)
+            let originalBody = parsed.bestReadableBody() ?? ""
+            body = """
+
+
+            ---------- Forwarded message ----------
+            From: \(parsed.header("From") ?? message.from)
+            Date: \(parsed.header("Date") ?? "")
+            Subject: \(parsed.header("Subject") ?? message.subject)
+            To: \(parsed.header("To") ?? "")
+
+            \(originalBody)
+            """
+        }
+        return ComposeTarget(
+            from: fromDefault,
+            to: "",
+            cc: "",
+            subject: message.subject.hasPrefix("Fwd: ") ? message.subject : "Fwd: \(message.subject)",
+            body: signatureBlock(for: fromDefault) + body,
+            sentFolder: session?.folderName(for: "sent", fallback: "Sent") ?? "Sent"
+        )
+    }
+
+    private func cachedRawMessage(for message: Message, accountID: UUID) -> String? {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("eml-corpus-\(accountID.uuidString)")
+            .appendingPathComponent("\(message.mailbox)-\(message.uid).eml")
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    // MARK: - Menu bar bridge
+
+    private var menuNotificationPublisher: AnyPublisher<Notification, Never> {
+        Publishers.MergeMany(
+            NotificationCenter.default.publisher(for: .menuComposeNewMessage),
+            NotificationCenter.default.publisher(for: .menuReply),
+            NotificationCenter.default.publisher(for: .menuReplyAll),
+            NotificationCenter.default.publisher(for: .menuForward),
+            NotificationCenter.default.publisher(for: .menuArchive),
+            NotificationCenter.default.publisher(for: .menuDelete),
+            NotificationCenter.default.publisher(for: .menuMoveToJunk),
+            NotificationCenter.default.publisher(for: .menuToggleUnread),
+            NotificationCenter.default.publisher(for: .menuSyncNow),
+            NotificationCenter.default.publisher(for: .menuShowShortcutsHelp)
+        ).eraseToAnyPublisher()
+    }
+
+    private func handleMenuNotification(_ notification: Notification) {
+        guard let session = currentSession else { return }
+        let selectedInSession = selectedMessages.compactMap { id in
+            session.messages.first(where: { $0.id == id })
+        }
+        switch notification.name {
+        case .menuComposeNewMessage:
+            let newMessageFrom = currentAccount?.email ?? accountsStore.accounts.first?.email ?? ""
+            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: session.folderName(for: "sent", fallback: "Sent"))
+        case .menuReply:
+            if selectedInSession.count == 1 { composeTarget = replyTarget(for: selectedInSession[0], replyAll: false) }
+        case .menuReplyAll:
+            if selectedInSession.count == 1 { composeTarget = replyTarget(for: selectedInSession[0], replyAll: true) }
+        case .menuForward:
+            if selectedInSession.count == 1 { composeTarget = forwardTarget(for: selectedInSession[0]) }
+        case .menuArchive:
+            selectedMessages = []
+            moveOrDelete(session: session, items: selectedInSession.map { (uid: $0.uid, mailbox: $0.mailbox) }, to: session.folderName(for: "archive", fallback: "Archive"))
+        case .menuDelete:
+            selectedMessages = []
+            moveOrDelete(session: session, items: selectedInSession.map { (uid: $0.uid, mailbox: $0.mailbox) }, to: session.folderName(for: "trash", fallback: "Trash"))
+        case .menuMoveToJunk:
+            selectedMessages = []
+            moveOrDelete(session: session, items: selectedInSession.map { (uid: $0.uid, mailbox: $0.mailbox) }, to: session.folderName(for: "junk", fallback: "Spam"))
+        case .menuToggleUnread:
+            if let first = selectedInSession.first {
+                session.toggleUnreadForMessages(items: selectedInSession.map { (uid: $0.uid, mailbox: $0.mailbox) }, markAsUnread: first.isSeen) { }
+            }
+        case .menuSyncNow:
+            session.syncNow()
+        case .menuShowShortcutsHelp:
+            showShortcutsHelp = true
+        default:
+            break
+        }
+    }
+}
+
+/// The message list, search, and toolbar for whichever mailbox/smart
+/// folder is currently selected - holds a direct @ObservedObject
+/// reference to the active session, the same proven pattern
+/// MessageDetailView already used correctly. This is the fix for a real,
+/// subtle bug: AccountSessionManager.sessions is a @Published dictionary,
+/// but SwiftUI only observes changes to the dictionary itself (a session
+/// added/removed) - it does NOT propagate when a MailSession *inside* that
+/// dictionary changes its own @Published properties. Reading
+/// session.messages through a plain computed property (as ContentView
+/// used to) meant the underlying data updated correctly but the view had
+/// no reliable signal to re-render, producing a persistent "shows what I
+/// selected previously" symptom. A direct @ObservedObject here fixes that
+/// at the source, for whichever session is actually active.
+struct MailboxContentColumn: View {
+    @ObservedObject var session: MailSession
+    @ObservedObject var accountsStore: AccountsStore
+    @ObservedObject var outbox: OutboxManager
+    @Binding var selectedMessages: Set<Message.ID>
+    @Binding var composeTarget: ContentView.ComposeTarget?
+    @Binding var redirectTarget: ContentView.RedirectTarget?
+    @Binding var searchQuery: String
+    @Binding var sortOption: SortOption
+    @Binding var showEmptyTrashConfirm: Bool
+    let sidebarSelection: SidebarSelection?
+    let currentAccount: Account
+    let mailboxes: [(role: String, name: String, label: String, icon: String)]
+    let allMessagesMailboxes: [String]
+    let onReply: (Message) -> Void
+    let onReplyAll: (Message) -> Void
+    let onForward: (Message) -> Void
+    let onComposeNew: () -> Void
+    let onSyncAllSessions: () -> Void
+
+    @State private var showOutboxPopover = false
+
     private var displayedMessages: [Message] {
         let base: [Message]
         if let searchResults = session.searchResults {
             base = searchResults
         } else if case .allMessages = sidebarSelection {
             base = session.messagesForMailboxes(allMessagesMailboxes)
-        } else if case .smartFolder(let id) = sidebarSelection,
+        } else if case .smartFolder(_, let id) = sidebarSelection,
                   let folder = session.smartFolders.first(where: { $0.id == id }) {
             base = session.messagesForSmartFolder(folder)
         } else {
@@ -440,199 +585,167 @@ struct ContentView: View {
         if case .allMessages = sidebarSelection {
             return "All Messages (\(displayedMessages.count))"
         }
-        if case .smartFolder(let id) = sidebarSelection,
+        if case .smartFolder(_, let id) = sidebarSelection,
            let folder = session.smartFolders.first(where: { $0.id == id }) {
             return "\(folder.name) (\(displayedMessages.count))"
         }
         return "\(currentMailboxLabel) (\(displayedMessages.count))"
     }
 
-    // MARK: - Menu bar bridge
-
-    /// All nine menu-triggered notifications merged into one publisher,
-    /// rather than nine separate .onReceive calls in body - see the comment
-    /// at the call site for why that mattered.
-    private var menuNotificationPublisher: AnyPublisher<Notification, Never> {
-        Publishers.MergeMany(
-            NotificationCenter.default.publisher(for: .menuComposeNewMessage),
-            NotificationCenter.default.publisher(for: .menuReply),
-            NotificationCenter.default.publisher(for: .menuReplyAll),
-            NotificationCenter.default.publisher(for: .menuForward),
-            NotificationCenter.default.publisher(for: .menuArchive),
-            NotificationCenter.default.publisher(for: .menuDelete),
-            NotificationCenter.default.publisher(for: .menuMoveToJunk),
-            NotificationCenter.default.publisher(for: .menuToggleUnread),
-            NotificationCenter.default.publisher(for: .menuSyncNow),
-            NotificationCenter.default.publisher(for: .menuShowShortcutsHelp)
-        ).eraseToAnyPublisher()
-    }
-
-    private func handleMenuNotification(_ notification: Notification) {
-        switch notification.name {
-        case .menuComposeNewMessage:
-            let newMessageFrom = accountsStore.accounts.first?.email ?? ""
-                        composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: session.folderName(for: "sent", fallback: "Sent"))
-        case .menuReply:
-            if let message = selectedSingleMessage { composeTarget = replyTarget(for: message, replyAll: false) }
-        case .menuReplyAll:
-            if let message = selectedSingleMessage { composeTarget = replyTarget(for: message, replyAll: true) }
-        case .menuForward:
-            if let message = selectedSingleMessage { composeTarget = forwardTarget(for: message) }
-        case .menuArchive:
-            performMove(to: session.folderName(for: "archive", fallback: "Archive"))
-        case .menuDelete:
-            performMove(to: session.folderName(for: "trash", fallback: "Trash"))
-        case .menuMoveToJunk:
-            performMove(to: session.folderName(for: "junk", fallback: "Spam"))
-        case .menuToggleUnread:
-            performToggleUnread()
-        case .menuSyncNow:
-            session.syncNow()
-        case .menuShowShortcutsHelp:
-            showShortcutsHelp = true
-        default:
-            break
-        }
-    }
-
-    // MARK: - Keyboard-shortcut actions
-
     private var selectedMessageObjects: [Message] {
         displayedMessages.filter { selectedMessages.contains($0.id) }
-    }
-
-    /// Used by menu-triggered Reply/Reply All/Forward, which - like their
-    /// button equivalents in MessageDetailView - only make sense against a
-    /// single selected message. nil (silently no-op) when zero or more than
-    /// one message is selected.
-    private var selectedSingleMessage: Message? {
-        guard selectedMessages.count == 1 else { return nil }
-        return selectedMessageObjects.first
-    }
-
-    /// Shared by keyboard/menu actions and drag-and-drop: moves items to a
-    /// destination mailbox, except when everything's already sitting in
-    /// Trash and the destination IS Trash - that's a permanent delete
-    /// (moving Trash to itself is rejected as a no-op by IMAP anyway).
-    private func moveOrDelete(items: [(uid: Int, mailbox: String)], to destinationMailbox: String) {
-        guard !items.isEmpty else { return }
-        let trashFolder = session.folderName(for: "trash", fallback: "Trash")
-        if destinationMailbox == trashFolder, items.allSatisfy({ $0.mailbox == trashFolder }) {
-            session.permanentlyDeleteMessages(uids: items.map { $0.uid }) { _ in }
-        } else {
-            session.moveMessages(items: items, to: destinationMailbox) { }
-        }
     }
 
     private func performMove(to destinationMailbox: String) {
         let objects = selectedMessageObjects
         guard !objects.isEmpty else { return }
         selectedMessages = []
-        moveOrDelete(items: objects.map { (uid: $0.uid, mailbox: $0.mailbox) }, to: destinationMailbox)
-    }
-
-    /// Parses the "mailbox|uid" id strings dragged from the message list
-    /// and moves them to wherever they were dropped.
-    private func handleDrop(ids: [String], to destinationMailbox: String) {
-        let items: [(uid: Int, mailbox: String)] = ids.compactMap { idString in
-            let parts = idString.split(separator: "|", maxSplits: 1)
-            guard parts.count == 2, let uid = Int(parts[1]) else { return nil }
-            return (uid: uid, mailbox: String(parts[0]))
-        }
-        for item in items {
-            selectedMessages.remove("\(item.mailbox)|\(item.uid)")
-        }
-        moveOrDelete(items: items, to: destinationMailbox)
+        moveOrDelete(session: session, items: objects.map { (uid: $0.uid, mailbox: $0.mailbox) }, to: destinationMailbox)
     }
 
     private func performToggleUnread() {
         let objects = selectedMessageObjects
         guard let first = objects.first else { return }
-        let markAsUnread = first.isSeen
         let items = objects.map { (uid: $0.uid, mailbox: $0.mailbox) }
-        session.toggleUnreadForMessages(items: items, markAsUnread: markAsUnread) { }
+        session.toggleUnreadForMessages(items: items, markAsUnread: first.isSeen) { }
     }
 
-    /// Formats an account's signature with the standard "-- " delimiter
-    /// line (dash-dash-space, on its own line) - the longstanding
-    /// convention most mail clients recognise for marking where a
-    /// signature block starts, e.g. for auto-stripping on reply. Returns
-    /// empty if the account has no signature set or isn't found.
-    private func signatureBlock(for email: String) -> String {
-        guard let account = accountsStore.accounts.first(where: { $0.email == email }),
-              !account.signature.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return ""
+    var body: some View {
+        Group {
+            if displayedMessages.isEmpty {
+                Text(session.searchResults != nil ? "No matching messages" : "No messages found")
+                    .foregroundStyle(.secondary)
+            } else {
+                List(displayedMessages, selection: $selectedMessages) { message in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 4) {
+                            if message.isFlaggedSpam {
+                                Image(systemName: "exclamationmark.shield.fill")
+                                    .foregroundStyle(.orange)
+                                    .font(.caption)
+                                    .help("Flagged as spam by the server's own filter" + (message.spamScore.map { " (score: \(String(format: "%.1f", $0)))" } ?? ""))
+                            }
+                            Text(message.subject)
+                                .font(.headline)
+                                .fontWeight(message.isSeen ? .regular : .semibold)
+                                .lineLimit(1)
+                        }
+                        HStack {
+                            Text(message.from)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(message.date, format: .dateTime.year().month().day().hour().minute())
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .tag(message.id)
+                    .draggable(message.id)
+                    .contextMenu {
+                        Button("Reply") { onReply(message) }
+                        Button("Reply All") { onReplyAll(message) }
+                        Button("Forward") { onForward(message) }
+                        Divider()
+                        Button("Archive") {
+                            moveOrDelete(session: session, items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "archive", fallback: "Archive"))
+                        }
+                        Button("Move to Junk") {
+                            moveOrDelete(session: session, items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "junk", fallback: "Spam"))
+                        }
+                        Button("Delete") {
+                            moveOrDelete(session: session, items: [(uid: message.uid, mailbox: message.mailbox)], to: session.folderName(for: "trash", fallback: "Trash"))
+                        }
+                        Divider()
+                        Button(message.isSeen ? "Mark as Unread" : "Mark as Read") {
+                            session.toggleUnreadForMessages(
+                                items: [(uid: message.uid, mailbox: message.mailbox)],
+                                markAsUnread: message.isSeen
+                            ) { }
+                        }
+                    }
+                }
+            }
         }
-        return "\n\n-- \n\(account.signature)\n"
-    }
-
-    // MARK: - Compose target construction
-
-    private func replyTarget(for message: Message, replyAll: Bool) -> ComposeTarget {
-        let isSent = message.mailbox == session.folderName(for: "sent", fallback: "Sent")
-        let fromDefault = isSent ? message.from : message.toAlias
-        let toDefault = isSent ? message.toAlias : message.from
-
-        var cc = ""
-        if replyAll, let raw = cachedRawMessage(for: message) {
-            let parsed = MIMEParser.parse(raw)
-            let originalTo = extractEmailAddresses(parsed.header("To") ?? "")
-            let originalCc = extractEmailAddresses(parsed.header("Cc") ?? "")
-            let ownAliases = accountsStore.accounts.map { $0.email.lowercased() }
-            let excluded = Set(ownAliases + [toDefault.lowercased()])
-            let ccList = (originalTo + originalCc).filter { !excluded.contains($0.lowercased()) }
-            var seen = Set<String>()
-            let deduped = ccList.filter { seen.insert($0.lowercased()).inserted }
-            cc = deduped.joined(separator: ", ")
+        .searchable(text: $searchQuery, placement: .toolbar, prompt: "Search \(currentMailboxLabel)")
+        .onSubmit(of: .search) {
+            session.search(query: searchQuery)
         }
-        return ComposeTarget(
-            from: fromDefault,
-            to: toDefault,
-            cc: cc,
-            subject: message.subject.hasPrefix("Re: ") ? message.subject : "Re: \(message.subject)",
-            body: signatureBlock(for: fromDefault),
-            sentFolder: session.folderName(for: "sent", fallback: "Sent")
-        )
-    }
-
-    private func forwardTarget(for message: Message) -> ComposeTarget {
-        let isSent = message.mailbox == session.folderName(for: "sent", fallback: "Sent")
-        let fromDefault = isSent ? message.from : message.toAlias
-
-        var body = ""
-        if let raw = cachedRawMessage(for: message) {
-            let parsed = MIMEParser.parse(raw)
-            let originalBody = parsed.bestReadableBody() ?? ""
-            body = """
-
-
-            ---------- Forwarded message ----------
-            From: \(parsed.header("From") ?? message.from)
-            Date: \(parsed.header("Date") ?? "")
-            Subject: \(parsed.header("Subject") ?? message.subject)
-            To: \(parsed.header("To") ?? "")
-
-            \(originalBody)
-            """
+        .onChange(of: searchQuery) { _, newValue in
+            if newValue.isEmpty { session.clearSearch() }
         }
-        return ComposeTarget(
-            from: fromDefault,
-            to: "",
-            cc: "",
-            subject: message.subject.hasPrefix("Fwd: ") ? message.subject : "Fwd: \(message.subject)",
-            body: signatureBlock(for: fromDefault) + body,
-            sentFolder: session.folderName(for: "sent", fallback: "Sent")
-        )
+        .navigationTitle(contentTitle)
+        .toolbar {
+            ToolbarItem(placement: .status) {
+                connectionStatusView
+            }
+            if !outbox.items.isEmpty {
+                ToolbarItem(placement: .status) {
+                    outboxIndicator
+                }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    session.syncNow()
+                } label: {
+                    if session.isSyncing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Sync", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
+                .help("Sync this mailbox now - checks for new mail and deletions, and refreshes read/unread status")
+                .disabled(session.connectionState != .ready || session.isSyncing)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    onComposeNew()
+                } label: {
+                    Label("Compose", systemImage: "square.and.pencil")
+                }
+                .help("New Message (⌘N)")
+                // Cmd+N is owned by the real menu bar now (MailAppApp.swift's
+                // CommandGroup replacing .newItem) - declaring it here too
+                // would risk a double-registration conflict.
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Picker("Sort by", selection: $sortOption) {
+                        ForEach(SortOption.allCases) { option in
+                            Text(option.rawValue).tag(option)
+                        }
+                    }
+                } label: {
+                    Label("Sort", systemImage: "arrow.up.arrow.down")
+                }
+                .help("Sort messages by date, sender, or recipient")
+            }
+            if session.currentMailbox == session.folderName(for: "trash", fallback: "Trash"),
+               sidebarSelection == .mailbox(accountID: currentAccount.id, name: session.folderName(for: "trash", fallback: "Trash")) {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(role: .destructive) {
+                        showEmptyTrashConfirm = true
+                    } label: {
+                        Label("Empty Trash", systemImage: "trash.slash")
+                    }
+                    .disabled(session.messages.isEmpty)
+                    .help("Permanently delete everything in Trash - this cannot be undone")
+                }
+            }
+        }
+        .confirmationDialog(
+            "Permanently delete all messages in Trash?",
+            isPresented: $showEmptyTrashConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Empty Trash", role: .destructive) {
+                session.emptyTrash(mailbox: session.folderName(for: "trash", fallback: "Trash")) { _ in }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This cannot be undone.")
+        }
     }
-
-    private func cachedRawMessage(for message: Message) -> String? {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("eml-corpus")
-            .appendingPathComponent("\(message.mailbox)-\(message.uid).eml")
-        return try? String(contentsOf: url, encoding: .utf8)
-    }
-
-    @State private var showOutboxPopover = false
 
     private var outboxIndicator: some View {
         Button {
@@ -730,7 +843,7 @@ struct ContentView: View {
                 .help("You went offline deliberately - tap to reconnect")
             } else {
                 Button {
-                    connectSession()
+                    onSyncAllSessions()
                 } label: {
                     Label("Offline - tap to retry", systemImage: "wifi.slash")
                 }
@@ -753,16 +866,6 @@ struct ContentView: View {
             .foregroundStyle(.green)
             .help("Tap to go offline")
         }
-    }
-
-    private func connectSession() {
-        // Stage 1 bridge: connects using the first configured account.
-        // Real per-account connections (one MailSession per account) come
-        // in a later stage - this keeps the app functional on the new
-        // multi-account foundation in the meantime.
-        guard let account = accountsStore.accounts.first,
-              let password = accountsStore.password(for: account) else { return }
-        session.connect(host: account.imapHost, port: account.imapPort, user: account.email, password: password)
     }
 }
 
@@ -1133,10 +1236,12 @@ struct AttachmentListView: View {
 }
 
 /// Reading pane: checks the .eml corpus first (instant), and if not found,
-/// fetches the body live from the server via the shared MailSession,
-/// caching the result to the corpus directory so future opens are instant too.
+/// fetches the body live from the server via the given account's
+/// MailSession, caching the result to that account's own corpus directory
+/// so future opens are instant too.
 struct MessageDetailView: View {
     let message: Message
+    let accountID: UUID
     @ObservedObject var session: MailSession
     let onReply: () -> Void
     let onReplyAll: () -> Void
@@ -1242,9 +1347,11 @@ struct MessageDetailView: View {
         }
     }
 
+    /// Each account has its own separate .eml cache folder now, hence
+    /// needing accountID to find the right one.
     private var corpusFileURL: URL {
         FileManager.default.temporaryDirectory
-            .appendingPathComponent("eml-corpus")
+            .appendingPathComponent("eml-corpus-\(accountID.uuidString)")
             .appendingPathComponent("\(message.mailbox)-\(message.uid).eml")
     }
 
