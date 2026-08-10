@@ -1585,6 +1585,10 @@ struct MessageDetailView: View {
     @State private var attachments: [MIMEPart.Attachment] = []
     @State private var loadState: LoadState = .loading
     @State private var errorText: String?
+    @State private var pgpBlock: String?
+    @State private var decryptedText: String?
+    @State private var isDecrypting = false
+    @State private var decryptError: String?
 
     enum LoadState {
         case loading, found, fetchingLive, failed
@@ -1657,7 +1661,41 @@ struct MessageDetailView: View {
                     }
                     .foregroundStyle(.secondary)
                 case .found:
-                    MessageBodyView(text: bodyText ?? "")
+                    if let pgpBlock {
+                        if let decryptedText {
+                            MessageBodyView(text: decryptedText)
+                        } else {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "lock.fill")
+                                        .foregroundStyle(.secondary)
+                                    Text("This message is PGP-encrypted")
+                                        .font(.subheadline)
+                                }
+                                if isDecrypting {
+                                    HStack(spacing: 6) {
+                                        ProgressView().controlSize(.small)
+                                        Text("Decrypting…")
+                                    }
+                                    .foregroundStyle(.secondary)
+                                } else {
+                                    Button("Decrypt") {
+                                        decryptPGP(pgpBlock)
+                                    }
+                                }
+                                if let decryptError {
+                                    Text(decryptError)
+                                        .font(.caption)
+                                        .foregroundStyle(.red)
+                                }
+                            }
+                            .padding(12)
+                            .background(Color.secondary.opacity(0.1))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+                    } else {
+                        MessageBodyView(text: bodyText ?? "")
+                    }
                     if !attachments.isEmpty {
                         AttachmentListView(attachments: attachments)
                     }
@@ -1672,6 +1710,10 @@ struct MessageDetailView: View {
         }
         .task(id: message.id) {
             contactAddState = .idle
+            pgpBlock = nil
+            decryptedText = nil
+            isDecrypting = false
+            decryptError = nil
             loadBody()
         }
         .task {
@@ -1734,6 +1776,7 @@ struct MessageDetailView: View {
         let parsed = MIMEParser.parse(raw)
         bodyText = parsed.bestReadableBody() ?? "(No readable body found in this message.)"
         attachments = parsed.findAttachments()
+        pgpBlock = parsed.pgpEncryptedBlock
         loadState = .found
 
         // Opening a message marks it read - standard mail client behaviour,
@@ -1741,6 +1784,19 @@ struct MessageDetailView: View {
         // mean something day to day rather than just being decorative.
         if !message.isSeen {
             session.toggleUnread(uid: message.uid, in: message.mailbox, markAsUnread: false) { _ in }
+        }
+    }
+
+    private func decryptPGP(_ block: String) {
+        isDecrypting = true
+        decryptError = nil
+        Task {
+            do {
+                decryptedText = try await GPGService.decrypt(block)
+            } catch {
+                decryptError = error.localizedDescription
+            }
+            isDecrypting = false
         }
     }
 }
