@@ -69,7 +69,7 @@ This was built incrementally, session by session, with a real amount of hard-won
 
 ## Status
 
-Actively developed, daily-driver quality for its author, not a finished product. Known gaps: no Drafts support yet, PGP decryption only (no signing/encrypting outgoing mail), Smart Folders are per-account rather than spanning accounts, full message-body search was deliberately not built (header/subject/sender search covers the actual daily need), single-machine personal use by default (not code-signed or notarized for wider distribution - see Code Signing above for what that involves).
+Actively developed, daily-driver quality for its author, not a finished product. Known gaps: PGP decryption only (no signing/encrypting outgoing mail), Smart Folders are per-account rather than spanning accounts, full message-body search was deliberately not built (header/subject/sender search covers the actual daily need), single-machine personal use by default (not code-signed or notarized for wider distribution - see Code Signing above for what that involves).
 
 ## License
 
