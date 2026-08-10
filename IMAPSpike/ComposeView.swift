@@ -9,6 +9,8 @@ struct ComposeView: View {
     @Environment(\.dismiss) private var dismiss
 
     let sentFolder: String
+    let accountID: UUID?
+    let draftsFolder: String?
     @State private var from: String
     @State private var to: String
     @State private var cc: String
@@ -20,16 +22,24 @@ struct ComposeView: View {
     @StateObject private var contactsService = ContactsService()
     @State private var toSuggestions: [ContactsService.ContactMatch] = []
     @State private var ccSuggestions: [ContactsService.ContactMatch] = []
+    @StateObject private var draftSession = ComposeSession()
+    @State private var currentDraftUID: Int?
+    @State private var isSavingDraft = false
+    @State private var draftSaveError: String?
+    @State private var currentSaveAttemptID: UUID?
 
-    init(outbox: OutboxManager, accountsStore: AccountsStore, from: String, to: String = "", cc: String = "", subject: String = "", messageBody: String = "", sentFolder: String) {
+    init(outbox: OutboxManager, accountsStore: AccountsStore, from: String, to: String = "", cc: String = "", subject: String = "", messageBody: String = "", sentFolder: String, accountID: UUID? = nil, existingDraftUID: Int? = nil, draftsFolder: String? = nil) {
         self.outbox = outbox
         self.accountsStore = accountsStore
         self.sentFolder = sentFolder
+        self.accountID = accountID
+        self.draftsFolder = draftsFolder
         _from = State(initialValue: from)
         _to = State(initialValue: to)
         _cc = State(initialValue: cc)
         _subject = State(initialValue: subject)
         _messageBody = State(initialValue: messageBody)
+        _currentDraftUID = State(initialValue: existingDraftUID)
     }
 
     var body: some View {
@@ -123,8 +133,26 @@ struct ComposeView: View {
                 }
                 .help("Attach files (⌘.)")
 
+                if isSavingDraft {
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.small)
+                        Text("Saving…")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                } else if let draftSaveError {
+                    Text(draftSaveError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
                 Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Save Draft") {
+                    saveDraft()
+                }
+                .disabled(accountID == nil || draftsFolder == nil || isSavingDraft)
+                .help(accountID == nil || draftsFolder == nil ? "Can't save a draft without a known account" : "Save as a draft (⌘S)")
+                Button("Close/Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button("Send") {
                     send()
@@ -133,8 +161,8 @@ struct ComposeView: View {
             }
             .padding()
         }
-        .frame(minWidth: 500, minHeight: 450)
-        .navigationTitle("New Message")
+        .frame(minWidth: idealComposeWidth, minHeight: 450)
+        .navigationTitle(currentDraftUID != nil ? "Edit Draft" : "New Message")
         .task {
             loadAliasOptions()
             contactsService.requestAccessIfNeeded()
@@ -156,6 +184,11 @@ struct ComposeView: View {
         .onKeyPress(KeyEquivalent("s"), phases: .down) { press in
             guard press.modifiers.isSuperset(of: [.command, .shift]) else { return .ignored }
             if !to.isEmpty && !subject.isEmpty { send() }
+            return .handled
+        }
+        .onKeyPress(KeyEquivalent("s"), phases: .down) { press in
+            guard press.modifiers.contains(.command), !press.modifiers.contains(.shift) else { return .ignored }
+            if accountID != nil, draftsFolder != nil { saveDraft() }
             return .handled
         }
         .onKeyPress(KeyEquivalent("."), phases: .down) { press in
@@ -272,6 +305,14 @@ struct ComposeView: View {
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
     }
 
+    /// ~65% of the current screen's width, floored at 600pt so it doesn't
+    /// get uncomfortably narrow on a smaller display. minWidth (not a fixed
+    /// width) so the window still stays user-resizable by hand afterward.
+    private var idealComposeWidth: CGFloat {
+        let screenWidth = NSScreen.main?.frame.width ?? 1200
+        return max(600, screenWidth * 0.65)
+    }
+
     private func pickAttachments() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
@@ -311,8 +352,55 @@ struct ComposeView: View {
             user: account.email, password: password,
             sentFolder: sentFolder,
             from: from, to: to, cc: cc, subject: subject, markdownBody: messageBody,
-            attachments: attachments
+            attachments: attachments,
+            draftsFolder: draftsFolder,
+            draftUIDToDelete: currentDraftUID
         )
         dismiss()
+    }
+
+    private func saveDraft() {
+        guard let accountID, let draftsFolder,
+              let account = accountsStore.accounts.first(where: { $0.id == accountID }),
+              let password = accountsStore.password(for: account) else {
+            return
+        }
+
+        isSavingDraft = true
+        draftSaveError = nil
+        let attemptID = UUID()
+        currentSaveAttemptID = attemptID
+
+        draftSession.saveDraft(
+            accountID: accountID,
+            imapHost: account.imapHost, imapPort: account.imapPort,
+            user: account.email, password: password,
+            draftsFolder: draftsFolder,
+            existingUID: currentDraftUID,
+            from: from, to: to, cc: cc, subject: subject, markdownBody: messageBody,
+            attachments: attachments
+        ) { result in
+            // Guards against a stale completion (e.g. arriving after the
+            // timeout below already gave up on this attempt) overwriting
+            // more current state.
+            guard currentSaveAttemptID == attemptID else { return }
+            isSavingDraft = false
+            switch result {
+            case .success(let newUID):
+                currentDraftUID = newUID
+            case .failure(let error):
+                draftSaveError = error.localizedDescription
+            }
+        }
+
+        // Safety net: without this, a genuinely hung network chain would
+        // leave "Saving..." showing forever with no feedback and no way
+        // to retry short of force-quitting.
+        Task {
+            try? await Task.sleep(for: .seconds(20))
+            guard currentSaveAttemptID == attemptID, isSavingDraft else { return }
+            isSavingDraft = false
+            draftSaveError = "Saving timed out - check your connection and try again."
+        }
     }
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 @main
 struct MailAppApp: App {
@@ -7,6 +8,19 @@ struct MailAppApp: App {
             ContentView()
         }
         .commands {
+            // A one-time setup action, not something reached for often -
+            // the application menu (far left) is the conventional home for
+            // this kind of thing, rather than cluttering the toolbar.
+            CommandGroup(after: .appInfo) {
+                Button("Set as Default Mail App") {
+                    NSWorkspace.shared.setDefaultApplication(at: Bundle.main.bundleURL, toOpenURLsWithScheme: "mailto") { error in
+                        if let error {
+                            print("Could not set as default mail app: \(error)")
+                        }
+                    }
+                }
+            }
+
             // Replaces the default "New Window"/"New Item" with our own
             // Compose action, so Cmd+N does the obviously-expected thing
             // in a mail client.

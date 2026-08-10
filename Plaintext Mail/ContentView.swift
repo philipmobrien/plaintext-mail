@@ -84,6 +84,9 @@ struct ContentView: View {
         let subject: String
         let body: String
         let sentFolder: String
+        let accountID: UUID?
+        let existingDraftUID: Int?
+        let draftsFolder: String?
     }
 
     struct RedirectTarget: Identifiable {
@@ -104,6 +107,7 @@ struct ContentView: View {
         guard let session = sessionManager.session(for: accountID) else { return [] }
         return [
             (role: "inbox", name: "INBOX", label: "Inbox", icon: "tray"),
+            (role: "drafts", name: session.folderName(for: "drafts", fallback: "Drafts"), label: "Drafts", icon: "doc.text"),
             (role: "sent", name: session.folderName(for: "sent", fallback: "Sent"), label: "Sent", icon: "paperplane"),
             (role: "archive", name: session.folderName(for: "archive", fallback: "Archive"), label: "Archive", icon: "archivebox"),
             (role: "junk", name: session.folderName(for: "junk", fallback: "Spam"), label: "Spam", icon: "nosign"),
@@ -257,7 +261,7 @@ struct ContentView: View {
                         },
                         onComposeNew: {
                             let newMessageFrom = accountsStore.accounts.first?.email ?? ""
-                            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: "Sent")
+                            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: "Sent", accountID: accountsStore.accounts.first?.id, existingDraftUID: nil, draftsFolder: accountsStore.accounts.first.flatMap { sessionManager.session(for: $0.id) }?.folderName(for: "drafts", fallback: "Drafts"))
                         },
                         onSyncAllSessions: { syncAllSessions() }
                     )
@@ -281,7 +285,7 @@ struct ContentView: View {
                         onForward: { message in composeTarget = forwardTarget(for: message, accountID: account.id, session: session) },
                         onComposeNew: {
                             let newMessageFrom = currentAccount?.email ?? accountsStore.accounts.first?.email ?? ""
-                            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: currentSession?.folderName(for: "sent", fallback: "Sent") ?? "Sent")
+                            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: currentSession?.folderName(for: "sent", fallback: "Sent") ?? "Sent", accountID: account.id, existingDraftUID: nil, draftsFolder: session.folderName(for: "drafts", fallback: "Drafts"))
                         },
                         onSyncAllSessions: { syncAllSessions() }
                     )
@@ -300,7 +304,7 @@ struct ContentView: View {
                 AddAccountView(accountsStore: accountsStore)
             }
             .sheet(item: $composeTarget) { target in
-                ComposeView(outbox: outbox, accountsStore: accountsStore, from: target.from, to: target.to, cc: target.cc, subject: target.subject, messageBody: target.body, sentFolder: target.sentFolder)
+                ComposeView(outbox: outbox, accountsStore: accountsStore, from: target.from, to: target.to, cc: target.cc, subject: target.subject, messageBody: target.body, sentFolder: target.sentFolder, accountID: target.accountID, existingDraftUID: target.existingDraftUID, draftsFolder: target.draftsFolder)
             }
             .sheet(item: $redirectTarget) { target in
                 RedirectView(
@@ -326,6 +330,12 @@ struct ContentView: View {
             }
             .onChange(of: accountsStore.accounts) { _, _ in
                 syncAllSessions()
+            }
+            .onChange(of: selectedMessages) { _, newValue in
+                openIfDraftSelected(newValue)
+            }
+            .onOpenURL { url in
+                handleMailtoURL(url)
             }
         } detail: {
             if case .allMessages = sidebarSelection, let accountMessage = selectedAccountMessage,
@@ -434,6 +444,92 @@ struct ContentView: View {
         return "\n\n-- \n\(account.signature)\n"
     }
 
+    /// If exactly one message got selected while viewing the Drafts
+    /// mailbox, open it in Compose for editing instead of the normal
+    /// reading pane - matching how drafts behave in every other mail
+    /// client. Clears the selection afterward so the reading pane doesn't
+    /// also try to show something for it.
+    /// Handles an incoming mailto: link (from clicking one elsewhere, once
+    /// this app is set as the default mail handler). mailto: isn't a
+    /// standard hierarchical URL the way https: is - RFC 6068 puts the
+    /// recipient address(es) directly after the scheme and before any "?",
+    /// with subject/body/cc/bcc as query parameters. URLComponents handles
+    /// this correctly; naive string splitting on "mailto:" and "?" would
+    /// be fragile against edge cases URLComponents already accounts for.
+    private func handleMailtoURL(_ url: URL) {
+        guard url.scheme?.lowercased() == "mailto",
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return
+        }
+        let recipient = components.path
+        var subject = ""
+        var body = ""
+        var cc = ""
+        for item in components.queryItems ?? [] {
+            switch item.name.lowercased() {
+            case "subject": subject = item.value ?? ""
+            case "body": body = item.value ?? ""
+            case "cc": cc = item.value ?? ""
+            default: break
+            }
+        }
+
+        let defaultFrom = accountsStore.accounts.first?.email ?? ""
+        let accountID = accountsStore.accounts.first?.id
+        let sentFolder = accountID.flatMap { sessionManager.session(for: $0) }?.folderName(for: "sent", fallback: "Sent") ?? "Sent"
+
+        composeTarget = ComposeTarget(
+            from: defaultFrom, to: recipient, cc: cc, subject: subject,
+            body: signatureBlock(for: defaultFrom) + body,
+            sentFolder: sentFolder,
+            accountID: accountID,
+            existingDraftUID: nil,
+            draftsFolder: accountID.flatMap { sessionManager.session(for: $0) }?.folderName(for: "drafts", fallback: "Drafts")
+        )
+    }
+
+    private func openIfDraftSelected(_ newSelection: Set<Message.ID>) {
+        guard case .mailbox(let accountID, let mailboxName) = sidebarSelection,
+              let session = sessionManager.session(for: accountID),
+              mailboxName == session.folderName(for: "drafts", fallback: "Drafts"),
+              newSelection.count == 1, let id = newSelection.first,
+              let message = session.messages.first(where: { $0.id == id }) else {
+            return
+        }
+        selectedMessages = []
+
+        if let raw = cachedRawMessage(for: message, accountID: accountID) {
+            openDraftCompose(raw: raw, message: message, accountID: accountID, session: session, mailboxName: mailboxName)
+        } else {
+            // Not cached yet - a draft that's never been opened before only
+            // has its envelope synced, not the full body. Fall back to a
+            // live fetch, same as the normal reading pane does.
+            session.fetchBody(uid: message.uid, mailbox: message.mailbox) { result in
+                if case .success(let raw) = result {
+                    openDraftCompose(raw: raw, message: message, accountID: accountID, session: session, mailboxName: mailboxName)
+                }
+            }
+        }
+    }
+
+    private func openDraftCompose(raw: String, message: Message, accountID: UUID, session: MailSession, mailboxName: String) {
+        let parsed = MIMEParser.parse(raw)
+        let fromRaw = parsed.header("From") ?? ""
+        let from = extractEmailAddresses(fromRaw).first ?? accountsStore.accounts.first(where: { $0.id == accountID })?.email ?? ""
+        let to = parsed.header("To") ?? ""
+        let cc = parsed.header("Cc") ?? ""
+        let subject = parsed.header("Subject") ?? ""
+        let body = parsed.bestReadableBody() ?? ""
+
+        composeTarget = ComposeTarget(
+            from: from, to: to, cc: cc, subject: subject, body: body,
+            sentFolder: session.folderName(for: "sent", fallback: "Sent"),
+            accountID: accountID,
+            existingDraftUID: message.uid,
+            draftsFolder: mailboxName
+        )
+    }
+
     private func syncAllSessions() {
         sessionManager.syncSessions(accounts: accountsStore.accounts, passwordLookup: { accountsStore.password(for: $0) })
         for session in sessionManager.sessions.values {
@@ -494,7 +590,10 @@ struct ContentView: View {
             cc: cc,
             subject: message.subject.hasPrefix("Re: ") ? message.subject : "Re: \(message.subject)",
             body: signatureBlock(for: fromDefault) + quotedBody,
-            sentFolder: session?.folderName(for: "sent", fallback: "Sent") ?? "Sent"
+            sentFolder: session?.folderName(for: "sent", fallback: "Sent") ?? "Sent",
+            accountID: accountID,
+            existingDraftUID: nil,
+            draftsFolder: session?.folderName(for: "drafts", fallback: "Drafts")
         )
     }
 
@@ -552,7 +651,10 @@ struct ContentView: View {
             cc: "",
             subject: message.subject.hasPrefix("Fwd: ") ? message.subject : "Fwd: \(message.subject)",
             body: signatureBlock(for: fromDefault) + body,
-            sentFolder: session?.folderName(for: "sent", fallback: "Sent") ?? "Sent"
+            sentFolder: session?.folderName(for: "sent", fallback: "Sent") ?? "Sent",
+            accountID: accountID,
+            existingDraftUID: nil,
+            draftsFolder: session?.folderName(for: "drafts", fallback: "Drafts")
         )
     }
 
@@ -597,7 +699,7 @@ struct ContentView: View {
         switch notification.name {
         case .menuComposeNewMessage:
             let newMessageFrom = currentAccount?.email ?? accountsStore.accounts.first?.email ?? ""
-            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: session.folderName(for: "sent", fallback: "Sent"))
+            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: session.folderName(for: "sent", fallback: "Sent"), accountID: currentAccount?.id, existingDraftUID: nil, draftsFolder: session.folderName(for: "drafts", fallback: "Drafts"))
         case .menuReply:
             if selectedInSession.count == 1, let accountID = currentAccount?.id { composeTarget = replyTarget(for: selectedInSession[0], replyAll: false, accountID: accountID, session: session) }
         case .menuReplyAll:
@@ -634,7 +736,7 @@ struct ContentView: View {
             switch notification.name {
             case .menuComposeNewMessage:
                 let newMessageFrom = accountsStore.accounts.first?.email ?? ""
-                composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: "Sent")
+                composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: "Sent", accountID: accountsStore.accounts.first?.id, existingDraftUID: nil, draftsFolder: accountsStore.accounts.first.flatMap { sessionManager.session(for: $0.id) }?.folderName(for: "drafts", fallback: "Drafts"))
             case .menuSyncNow:
                 syncAllSessions()
             case .menuShowShortcutsHelp:
@@ -648,7 +750,7 @@ struct ContentView: View {
         switch notification.name {
         case .menuComposeNewMessage:
             let newMessageFrom = accountsStore.accounts.first?.email ?? ""
-            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: session.folderName(for: "sent", fallback: "Sent"))
+            composeTarget = ComposeTarget(from: newMessageFrom, to: "", cc: "", subject: "", body: signatureBlock(for: newMessageFrom), sentFolder: session.folderName(for: "sent", fallback: "Sent"), accountID: accountMessage.accountID, existingDraftUID: nil, draftsFolder: session.folderName(for: "drafts", fallback: "Drafts"))
         case .menuReply:
             composeTarget = replyTarget(for: message, replyAll: false, accountID: accountMessage.accountID, session: session)
         case .menuReplyAll:

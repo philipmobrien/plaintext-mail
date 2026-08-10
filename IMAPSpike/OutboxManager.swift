@@ -24,6 +24,8 @@ final class OutboxManager: ObservableObject {
         let accountID: UUID
         let sentFolder: String
         let prebuiltRawMessage: String?
+        let draftsFolder: String?
+        let draftUIDToDelete: Int?
         let from: String
         let to: String
         let cc: String
@@ -48,7 +50,9 @@ final class OutboxManager: ObservableObject {
         sentFolder: String,
         from: String, to: String, cc: String, subject: String, markdownBody: String,
         attachments: [ComposeAttachment],
-        prebuiltRawMessage: String? = nil
+        prebuiltRawMessage: String? = nil,
+        draftsFolder: String? = nil,
+        draftUIDToDelete: Int? = nil
     ) {
         let item = OutboxItem(
             subjectPreview: subject.isEmpty ? "(no subject)" : subject,
@@ -58,6 +62,8 @@ final class OutboxManager: ObservableObject {
             accountID: accountID,
             sentFolder: sentFolder,
             prebuiltRawMessage: prebuiltRawMessage,
+            draftsFolder: draftsFolder,
+            draftUIDToDelete: draftUIDToDelete,
             from: from, to: to, cc: cc, subject: subject, markdownBody: markdownBody,
             attachments: attachments
         )
@@ -97,6 +103,18 @@ final class OutboxManager: ObservableObject {
                     switch result {
                     case .success:
                         self.items[idx].status = .sent
+                        // If this message started life as a draft, remove
+                        // that copy now it's actually been sent - otherwise
+                        // the same email would sit in both Sent and Drafts.
+                        if let draftsFolder = item.draftsFolder, let draftUID = item.draftUIDToDelete {
+                            let cleanupSession = ComposeSession()
+                            cleanupSession.deleteDraft(
+                                accountID: item.accountID,
+                                imapHost: item.imapHost, imapPort: item.imapPort,
+                                user: item.user, password: item.password,
+                                draftsFolder: draftsFolder, uid: draftUID
+                            ) { _ in }
+                        }
                         // Auto-clear successful sends after a moment, rather
                         // than leaving a permanently-growing "sent" list -
                         // the real record of a sent message is the Sent

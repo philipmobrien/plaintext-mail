@@ -290,13 +290,14 @@
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Plaintext-Mail-Info.plist";
 				INFOPLIST_KEY_NSContactsUsageDescription = "Used to autocomplete addresses when composing, and to save message senders as contacts.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.3.1;
+				MARKETING_VERSION = 0.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.pasigraphy.PlaintextMail;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -323,13 +324,14 @@
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Plaintext-Mail-Info.plist";
 				INFOPLIST_KEY_NSContactsUsageDescription = "Used to autocomplete addresses when composing, and to save message senders as contacts.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.3.1;
+				MARKETING_VERSION = 0.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.pasigraphy.PlaintextMail;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;

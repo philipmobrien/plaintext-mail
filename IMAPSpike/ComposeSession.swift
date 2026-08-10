@@ -170,14 +170,17 @@ final class ComposeSession: ObservableObject {
             client.send("LOGIN \(user) \(password)", redactLog: true) { reply, _ in
                 guard reply.key == "OK" else {
                     print("Save-to-Sent: login failed: \(reply.text)")
+                    client.logoutAndClose()
                     return
                 }
                 client.sendAppend(mailbox: sentFolder, rawMessage: rawMessage) { reply, _ in
                     guard reply.key == "OK" else {
                         print("Save-to-Sent: APPEND failed: \(reply.text)")
+                        client.logoutAndClose()
                         return
                     }
                     print("Save-to-Sent: appended successfully (\(reply.text))")
+                    client.logoutAndClose()
 
                     Task { @MainActor in
                         if let uid = reply.appendUID() {
@@ -213,6 +216,161 @@ final class ComposeSession: ObservableObject {
         let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus-\(accountID.uuidString)")
         try? FileManager.default.createDirectory(at: corpusDir, withIntermediateDirectories: true)
         try? rawMessage.write(to: corpusDir.appendingPathComponent("\(mailbox)-\(uid).eml"), atomically: true, encoding: .utf8)
+    }
+
+    /// Saves the current compose content as a draft - APPENDs to the
+    /// account's real Drafts folder, the same way Sent archiving works.
+    /// If `existingUID` is provided (editing a draft that was already
+    /// saved once), deletes that old copy first, so repeated saves
+    /// replace rather than pile up duplicates. Uses its own short-lived
+    /// connection, same as appendToSent - doesn't touch or disrupt
+    /// whatever the main browsing session currently has selected.
+    func saveDraft(
+        accountID: UUID,
+        imapHost: String, imapPort: Int, user: String, password: String,
+        draftsFolder: String,
+        existingUID: Int?,
+        from: String, to: String, cc: String, subject: String, markdownBody: String,
+        attachments: [ComposeAttachment] = [],
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        print("Save Draft: starting, host=\(imapHost):\(imapPort), draftsFolder=\(draftsFolder), existingUID=\(String(describing: existingUID))")
+        let rawMessage = MessageComposer.compose(from: from, to: to, cc: cc, subject: subject, markdownBody: markdownBody, attachments: attachments)
+        let portValue = NWEndpoint.Port(rawValue: UInt16(imapPort)) ?? 993
+        let client = IMAPClient(host: imapHost, port: portValue)
+
+        client.connect {
+            print("Save Draft: TCP/TLS connected, sending LOGIN")
+            client.send("LOGIN \(user) \(password)", redactLog: true) { reply, _ in
+                guard reply.key == "OK" else {
+                    print("Save Draft: LOGIN failed: \(reply.text)")
+                    client.logoutAndClose()
+                    Task { @MainActor in completion(.failure(SendError.authFailed(reply.text))) }
+                    return
+                }
+                print("Save Draft: LOGIN OK, sending SELECT \(draftsFolder)")
+                client.send("SELECT \(draftsFolder)") { reply, _ in
+                    guard reply.key == "OK" else {
+                        print("Save Draft: SELECT \(draftsFolder) failed: \(reply.text)")
+                        client.logoutAndClose()
+                        Task { @MainActor in completion(.failure(SendError.authFailed(reply.text))) }
+                        return
+                    }
+                    print("Save Draft: SELECT OK")
+
+                    func doAppend() {
+                        print("Save Draft: sending APPEND (\(rawMessage.count) chars)")
+                        client.sendAppend(mailbox: draftsFolder, rawMessage: rawMessage) { reply, _ in
+                            print("Save Draft: APPEND reply: key=\(reply.key), text=\(reply.text)")
+                            client.logoutAndClose()
+                            Task { @MainActor in
+                                guard reply.key == "OK", let newUID = reply.appendUID() else {
+                                    print("Save Draft: APPEND failed or no UID returned")
+                                    completion(.failure(SendError.authFailed(reply.text)))
+                                    return
+                                }
+                                print("Save Draft: APPEND succeeded, new UID=\(newUID)")
+                                self.upsertDraftLocally(accountID: accountID, oldUID: existingUID, newUID: newUID, mailbox: draftsFolder, rawMessage: rawMessage)
+                                print("Save Draft: local cache updated, calling completion")
+                                completion(.success(newUID))
+                            }
+                        }
+                    }
+
+                    if let existingUID {
+                        print("Save Draft: deleting old draft UID \(existingUID) first")
+                        client.send("UID STORE \(existingUID) +FLAGS (\\Deleted)") { reply, _ in
+                            print("Save Draft: STORE +Deleted reply: key=\(reply.key)")
+                            client.send("EXPUNGE") { reply, _ in
+                                print("Save Draft: EXPUNGE reply: key=\(reply.key)")
+                                doAppend()
+                            }
+                        }
+                    } else {
+                        doAppend()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Deletes a specific draft by UID - used both for explicitly
+    /// discarding a draft without sending it, and for cleaning up the old
+    /// draft copy once a message that started as a draft is actually sent
+    /// (otherwise you'd end up with the same email sitting in both Sent
+    /// and Drafts).
+    func deleteDraft(
+        accountID: UUID,
+        imapHost: String, imapPort: Int, user: String, password: String,
+        draftsFolder: String,
+        uid: Int,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        let portValue = NWEndpoint.Port(rawValue: UInt16(imapPort)) ?? 993
+        let client = IMAPClient(host: imapHost, port: portValue)
+        client.connect {
+            client.send("LOGIN \(user) \(password)", redactLog: true) { reply, _ in
+                guard reply.key == "OK" else {
+                    client.logoutAndClose()
+                    Task { @MainActor in completion(.failure(SendError.authFailed(reply.text))) }
+                    return
+                }
+                client.send("SELECT \(draftsFolder)") { reply, _ in
+                    guard reply.key == "OK" else {
+                        client.logoutAndClose()
+                        Task { @MainActor in completion(.failure(SendError.authFailed(reply.text))) }
+                        return
+                    }
+                    client.send("UID STORE \(uid) +FLAGS (\\Deleted)") { _, _ in
+                        client.send("EXPUNGE") { reply, _ in
+                            client.logoutAndClose()
+                            Task { @MainActor in
+                                guard reply.key == "OK" else {
+                                    completion(.failure(SendError.authFailed(reply.text)))
+                                    return
+                                }
+                                if let dbQueue = try? DatabaseSetup.makeDatabase(
+                                    at: FileManager.default.temporaryDirectory.appendingPathComponent("mail-\(accountID.uuidString).sqlite").path
+                                ) {
+                                    _ = try? dbQueue.write { db in
+                                        try Message.filter(Column("mailbox") == draftsFolder && Column("uid") == uid).deleteAll(db)
+                                    }
+                                }
+                                let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus-\(accountID.uuidString)")
+                                try? FileManager.default.removeItem(at: corpusDir.appendingPathComponent("\(draftsFolder)-\(uid).eml"))
+                                completion(.success(()))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func upsertDraftLocally(accountID: UUID, oldUID: Int?, newUID: Int, mailbox: String, rawMessage: String) {
+        guard let dbQueue = try? DatabaseSetup.makeDatabase(
+            at: FileManager.default.temporaryDirectory.appendingPathComponent("mail-\(accountID.uuidString).sqlite").path
+        ) else { return }
+
+        let parsed = MIMEParser.parse(rawMessage)
+        let subject = parsed.header("Subject") ?? "(no subject)"
+        let from = parsed.header("From") ?? ""
+        let to = parsed.header("To") ?? "(unknown)"
+
+        _ = try? dbQueue.write { db in
+            if let oldUID {
+                try Message.filter(Column("mailbox") == mailbox && Column("uid") == oldUID).deleteAll(db)
+            }
+            let message = Message(mailbox: mailbox, uid: newUID, subject: subject, from: from, toAlias: to, date: Date(), isSeen: true)
+            try message.insert(db)
+        }
+
+        let corpusDir = FileManager.default.temporaryDirectory.appendingPathComponent("eml-corpus-\(accountID.uuidString)")
+        try? FileManager.default.createDirectory(at: corpusDir, withIntermediateDirectories: true)
+        if let oldUID {
+            try? FileManager.default.removeItem(at: corpusDir.appendingPathComponent("\(mailbox)-\(oldUID).eml"))
+        }
+        try? rawMessage.write(to: corpusDir.appendingPathComponent("\(mailbox)-\(newUID).eml"), atomically: true, encoding: .utf8)
     }
 }
 
